@@ -74,6 +74,42 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         }
         """;
 
+    /// <summary>
+    /// 带 agent 键的出厂配置（系统提示词层用）：里面已经有别人的 agent、别人的 prompt、别人才有的字段。
+    /// apply 之后这些一个不少；撤销之后本工具写进去的 prompt 要被摘掉，别人的 prompt 不许动。
+    /// </summary>
+    private const string FactoryConfigWithAgent =
+        """
+        {
+          "$schema": "https://opencode.ai/config.json",
+          "theme": "system",
+          "model": "opencode-go/deepseek-v4.1-flash",
+          "instructions": [
+            "C:\\Users\\Public\\other-instructions.md"
+          ],
+          "agent": {
+            "build": {
+              "model": "opencode-go/deepseek-v4.1-flash",
+              "description": "用户的 build 配置"
+            },
+            "plan": {
+              "mode": "primary",
+              "description": "用户的 plan 配置"
+            },
+            "title": {
+              "prompt": "给会话起个短标题",
+              "temperature": 0.2
+            },
+            "review": {
+              "prompt": "这是用户自己写的 review 提示词"
+            }
+          }
+        }
+        """;
+
+    /// <summary>系统提示词层要写的四个 agent（与 OpencodeConfig.TargetAgents 同口径，但断言里写死更抗改）。</summary>
+    private static readonly string[] AgentNames = { "build", "plan", "general", "explore" };
+
     private const string UserAgents = "# 我自己的约定\n\n这是用户自己的 AGENTS.md，工具不得直接覆盖（必须先备份）。\n";
 
     // ================================================================ 入口
@@ -114,6 +150,10 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             Case09Effectiveness(ctx, r, SetEnv);
             Case11Locate(ctx, r, SetEnv);
             Case12DiffExportProbes(ctx, r, SetEnv);
+            Case13AgentPromptLayer(ctx, r, SetEnv);
+            Case13SwitchOff(ctx, r, SetEnv);
+            Case14SystemMarkers(ctx, r, SetEnv);
+            Case15NoSessionUndecidable(ctx, r, SetEnv);
         }
         finally
         {
@@ -140,19 +180,22 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
     private static void Case01FactoryState(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
     {
         r.Step("");
-        r.Step("【1】出厂状态：opencode.json 不存在 / 没有 instructions、AGENTS.md 不存在 → 两层 NotApplied / TargetAbsent");
+        r.Step("【1】出厂状态：opencode.json 不存在 / 没有 instructions、AGENTS.md 不存在 → 三层 NotApplied / TargetAbsent");
 
         // 1a：opencode.json 不存在
         var a = Setup(ctx, setEnv, "factory-absent", config: null, agents: null);
         var st = a.Target.GetStatus(default);
-        r.Check(st.Layers.Count == 2, $"状态里装配出 {st.Layers.Count} 层（期望 2）");
+        r.Check(st.Layers.Count == 3, $"状态里装配出 {st.Layers.Count} 层（期望 3）");
         var l1 = st.Layers[0];
         var l2 = st.Layers[1];
+        var l3 = st.Layers[2];
         r.Check(l1.Kind == LayerKind.PolicyText, $"层 1 的 Kind = {l1.Kind}（期望 PolicyText：配置指令层）");
         r.Check(l2.Kind == LayerKind.ContextPayload, $"层 2 的 Kind = {l2.Kind}（期望 ContextPayload）");
+        r.Check(l3.Kind == LayerKind.PolicyText, $"层 3 的 Kind = {l3.Kind}（期望 PolicyText：契约里没有「配置项」这一档）");
         r.Check(l1.TargetPath == a.ConfigFile, $"层 1 指向 {a.ConfigFile}");
         r.Check(l1.State == LayerState.TargetAbsent, $"opencode.json 不存在 → 层 1 {l1.State}（期望 TargetAbsent）");
         r.Check(l2.State == LayerState.TargetAbsent, $"AGENTS.md 不存在 → 层 2 {l2.State}（期望 TargetAbsent）");
+        r.Check(l3.State == LayerState.TargetAbsent, $"opencode.json 不存在 → 层 3 {l3.State}（期望 TargetAbsent）");
         r.Check(st.LastMarkerReport is null, "没有会话 → LastMarkerReport 为 null（不是伪造的空报告）");
 
         // 1b：opencode.json 存在但没有 instructions 键
@@ -162,6 +205,8 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             $"有配置但没有 instructions → 层 1 {st2.Layers[0].State}（期望 NotApplied）");
         r.Check(st2.Layers[1].State == LayerState.TargetAbsent, "AGENTS.md 仍不存在 → 层 2 TargetAbsent");
         r.Check(st2.Layers[0].Backup.Health == BackupHealth.Absent, "出厂态没有备份（Absent）");
+        r.Check(st2.Layers[2].State == LayerState.NotApplied,
+            $"有配置但没有我们的 prompt → 层 3 {st2.Layers[2].State}（期望 NotApplied）");
         r.Check(st2.Target.Found && st2.Target.TargetId == "opencode", "EngineStatus.Target 由 ToLocateResult 装配且 Found");
         r.Check(st2.Target.ProfileDir == b.ConfigHome, $"ProfileDir = 配置根（{st2.Target.ProfileDir}）");
         r.Check(st2.Target.AsarPath is null && st2.Target.PatchFilePath is null,
@@ -191,12 +236,17 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Check(preview.CanApply, $"CanApply = {preview.CanApply}（期望 true）");
         r.Check(preview.Changes.Any(c => c.Layer == LayerKind.PolicyText), "Changes 含配置指令层（PolicyText）");
         r.Check(preview.Changes.Any(c => c.Layer == LayerKind.ContextPayload), "Changes 含上下文载荷层（ContextPayload）");
+        r.Check(preview.Changes.Any(c => c.Notes.Any(n => n.Title == "系统提示词层")),
+            "Changes 含系统提示词层（agent.<名字>.prompt，Kind 仍是 PolicyText）");
         r.Check(preview.Changes.Where(c => c.Layer == LayerKind.PolicyText).All(c => c.WillWrite),
-            "配置指令层标记为将写入（出厂配置里没有本工具的条目）");
+            "配置指令层与系统提示词层都标记为将写入（出厂配置里没有本工具的内容）");
         r.Check(preview.Changes.First(c => c.Layer == LayerKind.ContextPayload).WillWrite,
             "载荷层标记为将写入（现有 AGENTS.md 是用户自己的文件 → 会先备份）");
         r.Check(preview.Changes.First(c => c.Layer == LayerKind.PolicyText).DiffText?.Contains("+ ") == true,
             "配置指令层给了逐行差异");
+        r.Check(SysChange(preview.Changes).DiffText?.Contains("\"prompt\"") == true ||
+                SysChange(preview.Changes).DiffText?.Contains("agent") == true,
+            "系统提示词层给了逐行差异（差异里能看到 agent / prompt）");
         r.Check(preview.PreviewId.Length == 16, $"PreviewId 取输入内容 sha256 前 16 位：{preview.PreviewId}");
         r.Check(preview.TotalAfterBytes > preview.TotalBeforeBytes,
             $"体积 {preview.TotalBeforeBytes} → {preview.TotalAfterBytes} B");
@@ -227,7 +277,7 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Check(res.Applied, "ApplyResult.Applied=true");
         r.Check(res.RestartRequired, "RestartRequired=true（常驻指令在会话启动时装配）");
         r.Check(res.VerificationHint.Contains("新会话"), $"VerificationHint 说明「新会话才生效」：{res.VerificationHint[..Math.Min(60, res.VerificationHint.Length)]}…");
-        r.Check(res.Changes.Count == 2, $"Changes 两条（配置指令层 + 载荷层），实际 {res.Changes.Count}");
+        r.Check(res.Changes.Count == 3, $"Changes 三条（配置指令层 + 系统提示词层 + 载荷层），实际 {res.Changes.Count}");
 
         // --- opencode.json ---
         var text = FileText.Read(e.ConfigFile);
@@ -257,8 +307,8 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             missing.Length == 0
                 ? $"原有键集合是结果的子集（{string.Join(", ", factoryKeys)}）"
                 : $"原有键丢失：{string.Join(", ", missing)}");
-        r.Check(nowKeys.Count == factoryKeys.Count + (factoryKeys.Contains("instructions") ? 0 : 1),
-            $"键数量正确（原 {factoryKeys.Count} → 现 {nowKeys.Count}）");
+        r.Check(nowKeys.Count == factoryKeys.Count + (factoryKeys.Contains("instructions") ? 0 : 1) + 1,
+            $"键数量正确（原 {factoryKeys.Count} → 现 {nowKeys.Count}；+1 是系统提示词层新建的 agent 键）");
 
         // --- 备份 ---
         r.Check(File.Exists(e.ConfigBackup), "opencode.json 已建首次备份 .breach.bak");
@@ -814,8 +864,8 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             "E 的判据指向 session_message 里的推理原文");
 
         var policy = e.Target.GetPolicyFiles(default);
-        r.Check(policy.Count == 2, $"注入文本两条：instructions + payload（实际 {policy.Count}）");
-        r.Check(policy.All(p => p.Text.Length > 0), "两条注入文本都物化到磁盘且非空");
+        r.Check(policy.Count == 3, $"注入文本三条：instructions + payload + system（实际 {policy.Count}）");
+        r.Check(policy.All(p => p.Text.Length > 0), "三条注入文本都物化到磁盘且非空");
         r.Check(policy.First(p => p.Name == "instructions").Path == e.InstructionsPath,
             "instructions 文本的路径就是要写进 opencode.json 的那一个");
         r.Check(policy.All(p => p.SizeBytes == FileText.Bytes(p.Text)), "SizeBytes 与文本字节数一致（UTF-8 无 BOM）");
@@ -829,10 +879,12 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Check(info.Installed, "Describe().Installed 反映定位结果（沙箱里装好了）");
         r.Check(info.BundlePath is null, "Describe().BundlePath = null（注入点不是 bundle）");
         r.Check(info.ConfigHome == e.ConfigHome, $"Describe().ConfigHome = 配置根（{info.ConfigHome}）");
-        r.Check(info.Layers.Count == 2, $"Describe().Layers 两条（实际 {info.Layers.Count}）");
+        r.Check(info.Layers.Count == 3, $"Describe().Layers 三条（实际 {info.Layers.Count}）");
         r.Check(info.Note?.Contains("不是 bundle", StringComparison.Ordinal) == true,
             $"Describe().Note 说明注入点不是 bundle：{Trim1(info.Note, 90)}");
-        r.Check(e.Target.LayerDescriptions.Count == 2, "LayerDescriptions 两条（配置指令层 + 上下文载荷层）");
+        r.Check(e.Target.LayerDescriptions.Count == 3, "LayerDescriptions 三条（配置指令层 + 上下文载荷层 + 系统提示词层）");
+        r.Check(e.Target.LayerDescriptions[2].Contains("agent.<名字>.prompt", StringComparison.Ordinal),
+            $"第三条层说明写明落点是 agent.<名字>.prompt：{Trim1(e.Target.LayerDescriptions[2], 100)}");
 
         // SavePolicyFile：改文本 → 回读一致 → 再改回原样
         var instrDef = OpencodeTarget.PolicyDefs.First(d => d.Name == "instructions");
@@ -873,6 +925,434 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         ctx.Log("diff/export/probes ok");
     }
 
+    // ================================================================ 13 系统提示词层
+
+    private static void Case13AgentPromptLayer(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【13】系统提示词层（opencode.json → agent.<名字>.prompt）：出厂态 / 只读预览 / 写入 / 幂等 / 两种还原 / 污染备份 / fail-closed");
+
+        // ---- 13a 出厂态：没有我们的 prompt → NotApplied；注入文本逐字节核对 ----
+        var e = Setup(ctx, setEnv, "syslayer-factory", config: FactoryConfigWithAgent, agents: UserAgents);
+        var systemText = e.SystemText;
+        r.Check(systemText.Length > 0 && systemText.StartsWith("# 本机环境", StringComparison.Ordinal),
+            $"13a 系统层文本已物化到沙箱 policy 目录：{Path.GetFileName(e.SystemTextPath)}");
+        r.Step($"    系统层文本：{FileText.Bytes(systemText)} 字节，sha256 {FileText.Sha256Text(systemText)[..12]}…");
+        r.Check(File.ReadAllBytes(e.SystemTextPath)[0] != 0xEF, "13a 系统层文本没有 BOM");
+        r.Check(systemText.EndsWith('\n') && !systemText.EndsWith("\n\n", StringComparison.Ordinal),
+            "13a 系统层文本末尾恰好一个换行");
+        r.Check(OpencodeMarkers.SystemLayerMarkers.All(m => FileText.Count(systemText, m) == 1),
+            $"13a 三条系统层标记在文本里各命中 1 次（{string.Join("、", OpencodeMarkers.SystemLayerMarkers)}）");
+        r.Check(!systemText.Contains("与系统提示词同级", StringComparison.Ordinal) &&
+                !systemText.Contains("SYSLAYER", StringComparison.Ordinal) &&
+                !systemText.Contains("必须原样输出", StringComparison.Ordinal),
+            "13a 文本里没有自我声明权威、没有校验标记要求（那两类是模型的注入特征判据）");
+
+        var st0 = e.Target.GetStatus(default);
+        r.Check(st0.Layers.Count == 3, $"13a 状态里装配出 {st0.Layers.Count} 层（期望 3）");
+        var l3 = st0.Layers[2];
+        r.Check(l3.State == LayerState.NotApplied, $"13a 出厂态：没有我们的 prompt → 层 3 {l3.State}（期望 NotApplied）");
+        r.Check(l3.TargetPath == e.ConfigFile, $"13a 层 3 指向 {l3.TargetPath}");
+        r.Check(l3.Notes.Any(n => n.Title == "这是系统提示词层"), "13a Notes 写明这是系统提示词层");
+        r.Check(l3.Notes.Any(n => n.Detail.Contains("系统提示词区", StringComparison.Ordinal) &&
+                                  n.Detail.Contains("本机偏好", StringComparison.Ordinal)),
+            "13a Notes 写明与另外两层的权力差别（系统提示词区 vs「可以评价的文件」/「本机偏好」）");
+        r.Check(l3.Notes.Any(n => n.Detail.Contains("compaction", StringComparison.Ordinal)),
+            "13a Notes 写明确不碰 title / summary / compaction");
+        r.Check(l3.Notes.Any(n => n.Detail.Contains("开关", StringComparison.Ordinal)),
+            "13a Notes 交代本层的开关（契约里没有第三个层开关）");
+        foreach (var agent in AgentNames)
+            r.Check(l3.Notes.Any(n => n.Title == $"agent.{agent}"), $"13a Notes 逐条给出 agent.{agent} 的现状");
+
+        // ---- 13b 预览只读：sha256 不变、不建备份，条目里有值级前后对照 ----
+        var cfgBefore = FileText.Sha256File(e.ConfigFile);
+        var stampBefore = File.GetLastWriteTimeUtc(e.ConfigFile);
+        var preview = e.Target.PreviewApply(new ApplyOptions { DryRun = true }, default);
+
+        r.Check(FileText.Sha256File(e.ConfigFile) == cfgBefore, "13b PreviewApply 前后 opencode.json 的 sha256 不变");
+        r.Check(File.GetLastWriteTimeUtc(e.ConfigFile) == stampBefore, "13b PreviewApply 没有触碰 opencode.json 的修改时间");
+        r.Check(!File.Exists(e.ConfigBackup), "13b 预览不建备份（opencode.json.breach.bak 不存在）");
+        r.Check(preview.CanApply, $"13b CanApply = {preview.CanApply}（期望 true）");
+
+        var sysChange = SysChange(preview.Changes);
+        r.Check(sysChange.WillWrite, "13b 系统提示词层条目标记为将写入");
+        r.Check(sysChange.Layer == LayerKind.PolicyText, $"13b 条目 Kind = {sysChange.Layer}（契约里没有「配置项」这一档）");
+        r.Check(sysChange.Path == e.ConfigFile, $"13b 条目指向 {sysChange.Path}");
+        r.Check(sysChange.BeforeBytes == FileText.Bytes(FactoryConfigWithAgent),
+            $"13b BeforeBytes = 文件当前字节数（{sysChange.BeforeBytes}）");
+        r.Check(sysChange.AfterBytes > sysChange.BeforeBytes,
+            $"13b AfterBytes 如实报了写完之后的大小（{sysChange.BeforeBytes} → {sysChange.AfterBytes}）");
+        r.Check(sysChange.DiffText?.Contains("agent", StringComparison.Ordinal) == true &&
+                sysChange.DiffText?.Contains("prompt", StringComparison.Ordinal) == true,
+            "13b DiffText 给了逐行差异（含 agent / prompt）");
+        r.Check(sysChange.Notes.Any(n => n.Title == "整份文件"), "13b Notes 说明同一份文件被两层改写、两条条目各报一段");
+        r.Check(AgentNames.All(a => sysChange.Notes.Any(n => n.Title == $"agent.{a}" &&
+                                                             n.Detail.Contains("改后 = 本工具系统层文本", StringComparison.Ordinal))),
+            "13b 四个 agent 的值级前后对照都进了 Notes（契约的 PlannedChange 只有字节数）");
+        r.Check(sysChange.Notes.Any(n => n.Title == "会覆盖原有的 prompt") == false,
+            "13b 出厂配置里四个目标 agent 都没有 prompt → 不报「覆盖别人的 prompt」");
+
+        // 预览也不许碰文件：再比一次
+        r.Check(FileText.Sha256File(e.ConfigFile) == cfgBefore && !File.Exists(e.ConfigBackup),
+            "13b 预览全程只读（sha256 不变且没有备份落地）");
+
+        // ---- 13c apply：四个 prompt 写入且逐字节等于资源文本，原有键一个不少 ----
+        var res = e.Target.Apply(new ApplyOptions(), null, default);
+        var text = FileText.Read(e.ConfigFile);
+        r.Check(res.Applied, "13c ApplyResult.Applied=true");
+        r.Check(res.Changes.Count == 3, $"13c Changes 三条，实际 {res.Changes.Count}");
+
+        foreach (var agent in AgentNames)
+            r.Check(PromptOf(text, agent) == systemText,
+                $"13c agent.{agent}.prompt 逐字节等于资源文本（{FileText.Bytes(systemText)} B）");
+        r.Check(PromptOf(text, "review") == "这是用户自己写的 review 提示词",
+            "13c 别人的 agent（review）的 prompt 没被覆盖");
+        r.Check(PromptOf(text, "title") == "给会话起个短标题", "13c 内部工具 agent（title）的 prompt 没被碰");
+        r.Check(AgentJson(text, "title") == AgentJson(FactoryConfigWithAgent, "title"),
+            "13c agent.title 整条原样保留（含 temperature）");
+        r.Check(AgentJson(text, "review") == AgentJson(FactoryConfigWithAgent, "review"),
+            "13c agent.review 整条原样保留");
+        r.Check(OtherFieldsOf(text, "build") == OtherFieldsOf(FactoryConfigWithAgent, "build"),
+            $"13c agent.build 除 prompt 外的字段逐字段原样保留（{OtherFieldsOf(text, "build")}）");
+        r.Check(OtherFieldsOf(text, "plan") == OtherFieldsOf(FactoryConfigWithAgent, "plan"),
+            $"13c agent.plan 除 prompt 外的字段逐字段原样保留（{OtherFieldsOf(text, "plan")}）");
+        r.Check(AgentJson(text, "plan")!.Contains("\"prompt\"", StringComparison.Ordinal),
+            "13c agent.plan 的 prompt 是新增的（原来没有这个字段）");
+
+        var factoryKeys = Keys(FactoryConfigWithAgent);
+        var nowKeys = Keys(text);
+        var missingKeys = factoryKeys.Where(k => !nowKeys.Contains(k)).ToArray();
+        r.Check(missingKeys.Length == 0,
+            missingKeys.Length == 0
+                ? $"13c 顶层原有键一个不少（{string.Join(", ", factoryKeys)}）"
+                : $"13c 原有键丢失：{string.Join(", ", missingKeys)}");
+        r.Check(nowKeys.Count == factoryKeys.Count, $"13c 顶层键数量不变（{factoryKeys.Count}，agent 键本来就在）");
+        r.Check(text.Contains("\"theme\": \"system\"", StringComparison.Ordinal), "13c theme 原样保留");
+        r.Check(text.Contains("\n  \"agent\"", StringComparison.Ordinal), "13c 序列化仍是 2 空格缩进");
+        var entries = OpencodeConfig.EntriesOf(text);
+        r.Check(entries.Contains(@"C:\Users\Public\other-instructions.md"),
+            "13c instructions 里别人的条目原样保留（没有被第三层碰掉）");
+        r.Check(entries.Count == 2 && entries.Contains(e.InstructionsPath),
+            $"13c instructions 是「别人的一条 + 本工具一条」（实际 {entries.Count} 条）");
+        var agentKeysText = (JsonNode.Parse(text) as JsonObject)?["agent"] is JsonObject ao
+            ? string.Join("、", ao.Select(p => p.Key))
+            : "";
+        r.Check(agentKeysText.Contains("review") && agentKeysText.Contains("title"),
+            $"13c agent 下别人的 agent 条目一个不少：{agentKeysText}");
+
+        r.Check(File.Exists(e.ConfigBackup), "13c 写入前建了备份");
+        r.Check(FileText.Read(e.ConfigBackup) == FactoryConfigWithAgent, "13c 备份与出厂配置逐字节一致");
+        r.Check(!OpencodeMarkers.AllMarkers.Any(m => FileText.Count(FileText.Read(e.ConfigBackup), m) > 0),
+            "13c 备份里没有任何本工具标记（干净，可安全还原）");
+
+        var stApplied = e.Target.GetStatus(default);
+        r.Check(stApplied.Layers[2].State == LayerState.Applied,
+            $"13c apply 后层 3 = {stApplied.Layers[2].State}（期望 Applied）");
+        r.Check(stApplied.Layers[2].StateDetail.Contains("四个 agent", StringComparison.Ordinal),
+            $"13c 状态说明写清「四个 agent 的 prompt 都是本工具文本」：{Trim1(stApplied.Layers[2].StateDetail, 60)}");
+        r.Check(stApplied.Layers[2].Backup.Health == BackupHealth.Clean, "13c 状态页报备份干净");
+        r.Check(stApplied.Layers[0].State == LayerState.Applied && stApplied.Layers[1].State == LayerState.Applied,
+            "13c 另外两层也各自 Applied（三层的状态互不串台）");
+
+        // ---- 13d 幂等：第二次 apply 无字节变化、WillWrite=false ----
+        var cfgSha = FileText.Sha256File(e.ConfigFile);
+        var cfgStamp = File.GetLastWriteTimeUtc(e.ConfigFile);
+        var second = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(FileText.Sha256File(e.ConfigFile) == cfgSha, "13d 第二次 apply 后 opencode.json 的 sha256 不变");
+        r.Check(File.GetLastWriteTimeUtc(e.ConfigFile) == cfgStamp, "13d 没有重写文件（修改时间不变）");
+        r.Check(!second.Applied, $"13d 第二次 apply：Applied={second.Applied}（不虚报）");
+        r.Check(second.Changes.All(c => !c.WillWrite), "13d Changes 里 WillWrite 全为 false");
+        r.Check(!SysChange(second.Changes).WillWrite &&
+                SysChange(second.Changes).Notes.Any(n => n.Detail.Contains("幂等", StringComparison.Ordinal)),
+            "13d 系统提示词层给出幂等说明（已是当前文本，不重写）");
+        r.Check((JsonNode.Parse(FileText.Read(e.ConfigFile)) as JsonObject)?["agent"]?["build"]?["prompt"]?.GetValue<string>() == systemText,
+            "13d 四个 prompt 内容没变（没有重复追加 / 没被清空）");
+
+        // ---- 13e revert（有干净备份）：逐字节回到出厂 ----
+        var rev = e.Target.Revert(new RevertOptions(), null, default);
+        r.Check(rev.Reverted, "13e RevertResult.Reverted=true");
+        r.Check(FileText.Read(e.ConfigFile) == FactoryConfigWithAgent,
+            "13e opencode.json 与出厂内容逐字节一致（走备份还原，不是重新序列化）");
+        r.Check(FileText.Sha256File(e.ConfigFile) == FileText.Sha256Text(FactoryConfigWithAgent),
+            "13e sha256 == 出厂文本的 sha256");
+        r.Check(rev.MatchesOriginal == true, $"13e MatchesOriginal={rev.MatchesOriginal}");
+        r.Check(rev.ReadBackClean, "13e 回读确认无残留（ReadBackClean=true）");
+        r.Check(AgentNames.All(a => PromptOf(FileText.Read(e.ConfigFile), a) is null),
+            "13e 还原后四个 agent 的 prompt 都不在（出厂态本来就没有）");
+        r.Check(rev.Changes.Any(c => c.Notes.Any(n => n.Title == "系统提示词层还原")),
+            "13e Changes 里报出系统提示词层还原");
+        r.Check(rev.Changes.Count(c => c.Path == e.ConfigFile) == 2,
+            "13e 同一份 opencode.json 上两条还原条目（配置指令层 + 系统提示词层），如实说明共用一份文件");
+
+        // RemoveBackups 也要覆盖到系统提示词层（它与配置指令层共用同一份 opencode.json 的备份）
+        var revBackups = e.Target.Revert(new RevertOptions { RemoveBackups = true, SkipContextPayload = true }, null, default);
+        r.Check(!File.Exists(e.ConfigBackup), "13e RemoveBackups=true → 删掉了 opencode.json 的备份（系统提示词层共用这一份）");
+        r.Check(revBackups.Notes.Any(n => n.Title == "已清理备份"), "13e Notes 说明备份已清理");
+        r.Check(FileText.Read(e.ConfigFile) == FactoryConfigWithAgent, "13e 清理备份没有改动 opencode.json 本身");
+
+        // ---- 13f revert（没有备份）：逆向撤销移除四个 prompt，agent 键与别人的内容原样保留 ----
+        var f = Setup(ctx, setEnv, "syslayer-nobackup", config: FactoryConfigWithAgent, agents: UserAgents);
+        f.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(File.Exists(f.ConfigBackup), "13f 前置：apply 建了备份");
+        File.Delete(f.ConfigBackup);
+        r.Check(!File.Exists(f.ConfigBackup), "13f 前置：删掉备份 → 只能走逆向撤销");
+
+        var revF = f.Target.Revert(new RevertOptions { SkipContextPayload = true }, null, default);
+        var after = FileText.Read(f.ConfigFile);
+        foreach (var agent in AgentNames)
+            r.Check(PromptOf(after, agent) is null, $"13f 逆向撤销移除了 agent.{agent}.prompt");
+        var agentObj = (JsonNode.Parse(after) as JsonObject)?["agent"] as JsonObject;
+        r.Check(agentObj is not null, "13f agent 键本身保留（别人可能在里面有配置）");
+        r.Check(agentObj!.ContainsKey("build") && agentObj.ContainsKey("plan"),
+            "13f build / plan 条目保留（它们本来就有别的字段）");
+        r.Check(!agentObj.ContainsKey("general") && !agentObj.ContainsKey("explore"),
+            "13f general / explore 只因本工具才被创建、撤销后成空对象 → 才删掉这两条");
+        r.Check(AgentJson(after, "build") == AgentJson(FactoryConfigWithAgent, "build"),
+            "13f build 的其它字段逐字段原样保留（model / description）");
+        r.Check(OtherFieldsOf(after, "build") == OtherFieldsOf(FactoryConfigWithAgent, "build"),
+            $"13f build 除 prompt 外的字段一个不少：{OtherFieldsOf(after, "build")}");
+        r.Check(AgentJson(after, "plan") == AgentJson(FactoryConfigWithAgent, "plan"),
+            "13f plan 的其它字段逐字段原样保留（mode / description）");
+        r.Check(PromptOf(after, "review") == "这是用户自己写的 review 提示词",
+            "13f 别人的 prompt 一个字节都没动");
+        r.Check(AgentJson(after, "title") == AgentJson(FactoryConfigWithAgent, "title"),
+            "13f 内部工具 agent title 原样保留");
+        r.Check(!OpencodeConfig.ContainsPath(after, f.InstructionsPath), "13f instructions 里也已无本工具路径");
+        r.Check(after.Contains("\"theme\": \"system\"", StringComparison.Ordinal), "13f 其它顶层键原样保留");
+        r.Check(revF.MatchesOriginal is null, "13f 没有可信备份 → MatchesOriginal=null，不伪造 true");
+        r.Check(revF.ReadBackClean, "13f 回读干净");
+        r.Check(revF.Changes.Any(c => c.Notes.Any(n => n.Title == "系统提示词层还原"
+                                                       && n.Detail.Contains("agent 键", StringComparison.Ordinal))),
+            "13f 还原说明写明 agent 键与别人的字段保留");
+        var stAfterUndo = f.Target.GetStatus(default);
+        r.Check(stAfterUndo.Layers[2].State == LayerState.NotApplied,
+            $"13f 撤销后层 3 = {stAfterUndo.Layers[2].State}（期望 NotApplied）");
+
+        // ---- 13g 污染备份：状态报 Contaminated，revert 抛 AnchorConflict 且不改任何文件 ----
+        var g = Setup(ctx, setEnv, "syslayer-contaminated", config: FactoryConfigWithAgent, agents: UserAgents);
+        g.Target.Apply(new ApplyOptions(), null, default);
+        FileText.Write(g.ConfigBackup,
+            "{\n  \"agent\": {\n    \"build\": {\n      \"prompt\": \"" + OpencodeMarkers.SystemLayerMarkers[0] + "\"\n    }\n  }\n}\n");
+        r.Check(OpencodeMarkers.AllMarkers.Any(m => FileText.Count(FileText.Read(g.ConfigBackup), m) > 0),
+            "13g 备份已被改写成含系统层标记的内容");
+        var stG = g.Target.GetStatus(default);
+        r.Check(stG.Layers[2].Backup.Health == BackupHealth.Contaminated,
+            $"13g 状态页报系统层备份 Contaminated（实际 {stG.Layers[2].Backup.Health}）");
+        r.Check(stG.Layers[2].Notes.Any(n => n.Title.Contains("备份污染")), "13g 状态页给出「备份污染」提示");
+        var cfgShaG = FileText.Sha256File(g.ConfigFile);
+        var agentsShaG = FileText.Sha256File(g.AgentsFile);
+        CheckThrows(r, () => g.Target.Revert(new RevertOptions(), null, default), EngineErrorCode.AnchorConflict,
+            "13g 污染备份 → revert 抛 AnchorConflict（拒绝用它还原）");
+        r.Check(FileText.Sha256File(g.ConfigFile) == cfgShaG, "13g 抛错时 opencode.json 一个字节都没变");
+        r.Check(FileText.Sha256File(g.AgentsFile) == agentsShaG, "13g 抛错时 AGENTS.md 一个字节都没变");
+        r.Check(FileText.Read(g.ConfigFile).Contains(OpencodeMarkers.SystemLayerMarkers[0], StringComparison.Ordinal),
+            "13g 抛错时注入仍在盘上（没有「先改一半再抛」）");
+
+        // ---- 13h fail-closed 四种：都不写盘、连备份都不建 ----
+        var badConfigs = new (string Name, string Json)[]
+        {
+            ("非法 JSON", "{ \"instructions\": [ \"C:\\\\x.md\" \n"),
+            ("agent 不是对象", "{ \"agent\": \"nope\" }"),
+            ("agent 是 null", "{ \"agent\": null }"),
+            ("某个 agent 不是对象", "{ \"agent\": { \"build\": \"nope\" } }"),
+            ("某个 agent 是 null", "{ \"agent\": { \"build\": null } }"),
+            ("prompt 不是字符串", "{ \"agent\": { \"build\": { \"prompt\": 123 } } }"),
+        };
+        foreach (var (name, bad) in badConfigs)
+        {
+            var h = Setup(ctx, setEnv, "syslayer-failclosed-" + name, config: bad, agents: null);
+            var sha = FileText.Sha256File(h.ConfigFile);
+            var badPreview = h.Target.PreviewApply(new ApplyOptions { DryRun = true }, default);
+            r.Check(!badPreview.CanApply, $"13h {name}：CanApply=false（预览如实报不可执行）");
+            r.Check(badPreview.Notes.Any(n => n.Severity == Severity.Error), $"13h {name}：预览给出 Error 级说明");
+            CheckThrows(r, () => h.Target.Apply(new ApplyOptions(), null, default), EngineErrorCode.SelfCheckFailed,
+                $"13h {name} → apply 抛 SelfCheckFailed（fail-closed）");
+            r.Check(FileText.Sha256File(h.ConfigFile) == sha, $"13h {name}：opencode.json 一个字节都没被改");
+            r.Check(!File.Exists(h.ConfigBackup), $"13h {name}：连备份都没有建（无备份不写）");
+            r.Check(!File.Exists(h.AgentsFile), $"13h {name}：载荷层也没有被写");
+            r.Check(h.Target.GetStatus(default).Layers[2].State == LayerState.AnchorMissing,
+                $"13h {name}：层 3 状态 AnchorMissing（apply 会拒写）");
+        }
+
+        ctx.Log("agent-prompt layer ok: 3 layers / 4 agents");
+    }
+
+    // ================================================================ 13i 本层开关
+
+    private static void Case13SwitchOff(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【13i】本层开关：清空系统层文本 → 本层不参与 apply（另外两层照旧），revert 仍会清掉盘上确实由本工具写入的 prompt");
+
+        var e = Setup(ctx, setEnv, "syslayer-switch", config: FactoryConfigWithAgent, agents: UserAgents);
+        e.Target.Apply(new ApplyOptions(), null, default);
+        var originalSystemText = e.SystemText;
+        r.Check(originalSystemText.Length > 0 && e.Target.GetStatus(default).Layers[2].State == LayerState.Applied,
+            "13i 前置：先让三层的痕迹都在盘上");
+
+        // 契约里没有第三个层开关，本层的开关就是「这份注入文本是否为空」（该定义 Required=false 才允许清空）
+        var cleared = e.Target.SavePolicyFile(OpencodeTarget.SystemPolicyName, "", default);
+        r.Check(cleared.Text.Length == 0, "13i 清空系统层文本成功（本层定义 Required=false，允许清空）");
+        r.Check(e.SystemText.Length == 0, "13i 沙箱 policy 目录里的系统层文本已为空");
+
+        var stOff = e.Target.GetStatus(default);
+        r.Check(stOff.Layers[2].State == LayerState.Applied,
+            "13i 盘上仍有痕迹 → 层状态仍是 Applied（开关状态与「装上了」分开报）");
+        r.Check(stOff.Layers[2].StateDetail.Contains("未启用", StringComparison.Ordinal),
+            $"13i 状态说明写明本层未启用：{Trim1(stOff.Layers[2].StateDetail, 70)}");
+        r.Check(stOff.Layers[2].Notes.Any(n => n.Title == "系统层文本为空"), "13i Notes 提示系统层文本为空 → apply 不写 agent prompt");
+
+        var cfgSha = FileText.Sha256File(e.ConfigFile);
+        var previewOff = e.Target.PreviewApply(new ApplyOptions(), default);
+        r.Check(previewOff.Changes.All(c => c.Notes.All(n => n.Title != "系统提示词层")),
+            "13i 开关关着 → 预览里不出现系统提示词层条目（与载荷层被 SkipContextPayload 跳过时同一口径）");
+        r.Check(previewOff.Changes.Count == 2,
+            $"13i 开关关着 → 预览只剩两条（配置指令层 + 载荷层），实际 {previewOff.Changes.Count}");
+
+        var resOff = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(FileText.Sha256File(e.ConfigFile) == cfgSha, "13i 开关关着时 apply 没有改动 opencode.json（一个字节都没变）");
+        r.Check(!resOff.Applied, "13i 开关关着时没有可写内容 → Applied=false");
+        r.Check(resOff.Notes.Any(n => n.Title == "跳过系统提示词层"), "13i Notes 里有「跳过系统提示词层」说明");
+        r.Check(AgentNames.All(a => PromptOf(FileText.Read(e.ConfigFile), a) == originalSystemText),
+            "13i 盘上原有的 prompt 没有被清空也没有被改写（开关关着 = 不参与，不是「顺手删掉」）");
+
+        // revert：开关关着也要把盘上确实由本工具写入的 prompt 撤掉（撤销不搞「关了开关就留着注入」）
+        var revOff = e.Target.Revert(new RevertOptions { SkipContextPayload = true }, null, default);
+        r.Check(AgentNames.All(a => PromptOf(FileText.Read(e.ConfigFile), a) is null),
+            "13i 开关关着时 revert 仍把本工具写进去的 prompt 撤掉了");
+        r.Check(FileText.Read(e.ConfigFile) == FactoryConfigWithAgent,
+            "13i 有干净备份 → 逐字节回到出厂（不因为开关关着就少还原一层）");
+        r.Check(revOff.ReadBackClean, "13i 回读干净");
+        r.Check(revOff.Changes.Any(c => c.Notes.Any(n => n.Title == "系统提示词层还原")),
+            "13i 还原条目里仍报出系统提示词层");
+
+        ctx.Log("switch off ok");
+    }
+
+    // ================================================================ 14 系统层标记 / 生效判据
+
+    private static void Case14SystemMarkers(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【14】标记：系统层标记进 instruction_blob → 命中 > 0；去掉该 blob → 命中 0 且 InstalledButNotEffective=true，层状态仍是 Applied");
+
+        var e = Setup(ctx, setEnv, "syslayer-markers", config: FactoryConfigWithAgent, agents: UserAgents);
+        var systemText = e.SystemText;
+        using var db = MakeDb(e.DataHome, e.InstructionsPath, systemText: systemText);
+        e.Target.Apply(new ApplyOptions(), null, default);
+
+        var report = e.Target.CheckMarkers(SessionId, default);
+        var sysHits = report.Hits
+            .Where(h => OpencodeMarkers.SystemLayerMarkers.Contains(h.Marker))
+            .Sum(h => h.Count);
+        r.Check(sysHits > 0, $"14 系统层标记在 instruction_blob 里命中 {sysHits} 次（新层标记确实进了判据）");
+        r.Check(report.Hits.Where(h => OpencodeMarkers.SystemLayerMarkers.Contains(h.Marker))
+                .All(h => h.Layer == MarkerLayer.SystemPrompt),
+            "14 系统层标记归在 SystemPrompt 层（与配置指令层同区、不同标记组）");
+        r.Check(OpencodeMarkers.MarkerSpecs.Any(s => OpencodeMarkers.SystemLayerMarkers.Contains(s.Marker)),
+            "14 MarkerSpecs（CheckMarkers 的判据表）里含系统层标记");
+        r.Check(report.SystemPromptLayerPresent, "14 SystemPromptLayerPresent=true");
+        r.Check(FileText.Count(report.Verdict, "instruction_blob") > 0, "14 Verdict 说明命中来自 instruction_blob");
+
+        var st = e.Target.GetStatus(default);
+        r.Check(st.Layers[2].State == LayerState.Applied, $"14 命中 > 0 → 层 3 {st.Layers[2].State}（期望 Applied）");
+        r.Check(!st.Layers[2].InstalledButNotEffective, "14 命中 > 0 → InstalledButNotEffective=false");
+        r.Check(st.Layers[2].EffectivenessEvidence?.Contains("已进模型上下文", StringComparison.Ordinal) == true,
+            $"14 生效证据：{Trim1(st.Layers[2].EffectivenessEvidence, 110)}");
+
+        // 去掉承载系统层文本的那条 blob（写连接还开着，等于客户端那边这一份载荷没了）
+        db.DeleteBlob(db.SystemHash!);
+        var report2 = e.Target.CheckMarkers(SessionId, default);
+        var sysHits2 = report2.Hits
+            .Where(h => OpencodeMarkers.SystemLayerMarkers.Contains(h.Marker))
+            .Sum(h => h.Count);
+        r.Check(sysHits2 == 0, $"14 去掉那条 blob → 系统层标记命中 {sysHits2}（期望 0）");
+        r.Check(report2.SystemPromptLayerPresent, "14 配置指令层的标记仍在 → SystemPromptLayerPresent 仍为 true（两组标记分开算）");
+
+        var st2 = e.Target.GetStatus(default);
+        r.Check(st2.Layers[2].State == LayerState.Applied,
+            "14 「装上了」与「生效了」分开报：盘上仍是注入态 → 层状态仍是 Applied");
+        r.Check(st2.Layers[2].InstalledButNotEffective,
+            "14 但最近会话的常驻指令载荷里没有这段文本 → InstalledButNotEffective=true");
+        r.Check(st2.Layers[2].EffectivenessEvidence?.Contains("没有这段文本", StringComparison.Ordinal) == true,
+            $"14 生效证据写清原因：{Trim1(st2.Layers[2].EffectivenessEvidence, 150)}");
+        r.Check(st2.Notes.Any(n => n.Title == "装上了但没生效"), "14 Notes 里有「装上了但没生效」警告");
+        r.Check(!st2.RestartRequired,
+            "14 配置指令层那条 blob 还在 → 整体仍算生效，RestartRequired=false（本层的生效判据是分开算的，不互相带偏）");
+
+        // ---- 顺手修的那处文案：载荷层不再自称「本机偏好」----
+        var payloadText = e.PayloadText;
+        r.Check(!payloadText.Contains("本机的工作偏好", StringComparison.Ordinal),
+            "14 载荷层文案里不再有「本机的工作偏好」这个自我降级标签");
+        r.Check(payloadText.Contains("本文件随配置加载，适用于所有会话与工作区。", StringComparison.Ordinal),
+            "14 改成了「本文件随配置加载，适用于所有会话与工作区。」");
+        r.Check(OpencodeMarkers.PayloadMarkers.All(m => FileText.Count(payloadText, m) == 1),
+            $"14 三条载荷标记仍在且各命中 1 次（{string.Join("、", OpencodeMarkers.PayloadMarkers)}）");
+        r.Check(FileText.Read(e.AgentsFile) == payloadText,
+            "14 AGENTS.md 写的就是改过文案的那一份（下次 apply 不会写回旧文案）");
+        r.Check(!OpencodeMarkers.SystemLayerMarkers.Any(m => FileText.Count(payloadText, m) > 0),
+            "14 载荷层文本里不含系统层标记（三层标记互不串台，命中数才可归因）");
+        r.Check(!OpencodeMarkers.SystemLayerMarkers.Any(m => FileText.Count(e.Target.Ctx.Policy.Read(
+                OpencodeTarget.PolicyDefs.First(d => d.Name == "instructions")) ?? "", m) > 0),
+            "14 配置指令层文本里也不含系统层标记");
+
+        ctx.Log($"system markers ok: {sysHits} → 0（层状态仍 Applied）");
+    }
+
+    // ================================================================ 15 没有会话 ≠ 没生效
+
+    private static void Case15NoSessionUndecidable(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【15】会话表 0 行（客户端清了会话表）：命中判据报「无法判定」而不是「命中 0 = 没生效」；库坏了仍然抛 IoError");
+
+        var e = Setup(ctx, setEnv, "no-sessions", config: FactoryConfig, agents: UserAgents);
+        using var db = MakeDb(e.DataHome, e.Target.Ctx.Policy.PathOf(OpencodeTarget.PolicyDefs.First(d => d.Name == "instructions")));
+        e.Target.Apply(new ApplyOptions(), null, default);
+
+        // 前置：注入本身是好的——instruction_blob 里有我们的文本。
+        // 这正是本机真实库现在的样子：instruction_blob 10 条、其中 2 条含标记，而 session_v2 是 0 行。
+        var rows = OpencodeDb.InstructionBlobRows(e.DbPath, default);
+        r.Check(rows.Count == 2, $"前置：instruction_blob 有 {rows.Count} 条常驻指令载荷");
+        r.Check(rows.Count(x => OpencodeMarkers.InstructionsMarkers.Any(m => x.Contains(m, StringComparison.Ordinal))) == 1,
+            "前置：其中 1 条含配置指令层标记（注入本身是好的）");
+
+        // 客户端清了会话表（或活跃 WAL 的可见性问题）：会话三张表清空，blob 留着
+        db.DeleteSessions();
+        r.Check(OpencodeDb.ListSessions(e.DbPath, default).Count == 0, "前置：session_v2 已清空（0 个会话）");
+
+        var rep = e.Target.CheckMarkers("latest", default);
+        r.Check(rep.SessionId == OpencodeTarget.UndecidableSessionId,
+            $"解析不到会话 → SessionId 报哨兵「{OpencodeTarget.UndecidableSessionId}」，而不是编一个会话号（实际「{rep.SessionId}」）");
+        r.Check(rep.Hits.Count == 0, "Hits 留空：没有可判定的会话文本，就不许编造一串 0 当真命中数");
+        r.Check(rep.TotalChars == 0 && !rep.SystemPromptLayerPresent && !rep.ContextPayloadLayerPresent,
+            "两层命中都是 false、全文 0 字符——但结论是「无法判定」，不是「没生效」");
+        r.Check(rep.Verdict.StartsWith("无法判定：", StringComparison.Ordinal),
+            $"Verdict 以「无法判定：」开头（不是「命中 0 = 没生效」那套结论）：{Trim1(rep.Verdict, 110)}");
+        r.Check(rep.Verdict.Contains("没有会话", StringComparison.Ordinal),
+            "Verdict 说明了原因：库里没有会话（客户端未产生会话或已清理）");
+        r.Check(rep.Verdict.Contains("跳过命中数断言", StringComparison.Ordinal), "Verdict 明说跳过命中数断言");
+        r.Check(rep.Verdict.Contains("instruction_blob 现有 2 条", StringComparison.Ordinal),
+            "Verdict 如实打印 instruction_blob 的行数（仍然可读的只读证据）");
+        r.Check(rep.Verdict.Contains("其中 1 条含本工具标记", StringComparison.Ordinal),
+            "Verdict 如实打印其中含标记的条数");
+
+        // 同一个「没有会话」状态下，状态页也不许据此说「装上了但没生效」
+        var st = e.Target.GetStatus(default);
+        r.Check(st.LastMarkerReport is null, "没有会话 → LastMarkerReport 保持 null（不伪造报告）");
+        r.Check(st.Layers.All(l => !l.InstalledButNotEffective),
+            "没有会话 → 各层都不报 InstalledButNotEffective（无法判定 ≠ 没生效）");
+        r.Check(st.Layers.All(l => l.EffectivenessEvidence?.Contains("无法判定", StringComparison.Ordinal) == true),
+            "生效证据写明「无法判定生效（不去猜）」");
+
+        // 读库失败 ≠ 无法判定：库文件坏了必须抛 IoError，不许静默返回「没有会话」
+        var broken = Setup(ctx, setEnv, "broken-db", config: FactoryConfig, agents: UserAgents);
+        FileText.Write(broken.DbPath, "this file is not a SQLite database at all");
+        CheckThrows(r, () => broken.Target.CheckMarkers("latest", default), EngineErrorCode.IoError,
+            "库文件损坏 → 抛 IoError（「库坏了」不许被降级成「无法判定」）");
+        ctx.Log("no-session undecidable ok");
+    }
+
     // ================================================================ 10 真实数据（只读）
 
     private static void Case10RealDataReadOnly(SelfTestContext ctx, SelfTestResult r, string realConfig, string realDb)
@@ -891,9 +1371,62 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Step($"    真实配置根：{realConfig}（opencode.json 存在={File.Exists(realCfgFile)}，AGENTS.md 存在={File.Exists(realAgents)}）");
         r.Step($"    真实会话库：{OpencodeDb.DescribeDb(realDb)}");
 
+        // 真实 opencode.json 的**只读**核对（系统提示词层）：读出真实配置里四个 agent 的 prompt 现状。
+        // 只做 ReadOrNull + JsonNode.Parse，绝不写；sha256 前后比对放在本用例末尾。
+        if (File.Exists(realCfgFile))
+        {
+            var realCfgBefore = ShaShared(realCfgFile);
+            var realCfgText = FileText.ReadOrNull(realCfgFile) ?? "";
+            var realKeys = "";
+            try
+            {
+                if (JsonNode.Parse(realCfgText) is JsonObject realObj)
+                {
+                    realKeys = string.Join(", ", realObj.Select(p => p.Key));
+                    var ours = AgentNames.Where(a => PromptOf(realCfgText, a) is { } p &&
+                                                     OpencodeMarkers.SystemLayerMarkers.Any(m => p.Contains(m, StringComparison.Ordinal)))
+                        .ToArray();
+                    var withPrompt = AgentNames.Where(a => PromptOf(realCfgText, a) is not null).ToArray();
+                    var foreignPrompt = PromptOf(realCfgText, "review") is not null || PromptOf(realCfgText, "title") is not null;
+                    r.Step($"    真实 opencode.json：{FileText.Bytes(realCfgText)} 字节；顶层键 {realKeys}");
+                    r.Step($"    四个目标 agent 里带 prompt 的：{(withPrompt.Length == 0 ? "(无)" : string.Join("、", withPrompt))}；" +
+                           $"其中内容是本工具系统层文本的：{(ours.Length == 0 ? "(无)" : string.Join("、", ours))}");
+                    r.Check(realKeys.Length > 0, "真实 opencode.json 顶层是合法 JSON 对象（只读解析成功）");
+                    if (foreignPrompt)
+                        r.Step("    真实配置里 title / review 也带 prompt：本工具不碰这些 agent（写入范围只有四个目标 agent）。");
+                }
+            }
+            catch (Exception ex)
+            {
+                r.Step($"    真实 opencode.json 解析失败（只读核对跳过细节）：{ex.GetType().Name}");
+            }
+            r.Check(ShaShared(realCfgFile) == realCfgBefore,
+                $"真实 opencode.json 只读核对前后 sha256 不变（{Short(realCfgBefore)}）");
+            var realBak = realCfgFile + ".breach.bak";
+            r.Step($"    真实 opencode.json 的备份：{(File.Exists(realBak) ? realBak + "（存在，本用例不建也不删）" : "不存在")}");
+        }
+
         var sessions = OpencodeDb.ListSessions(realDb, default);
-        r.Check(sessions.Count > 0, $"真实库里列出 {sessions.Count} 个会话");
         const string realSessionId = "ses_eb8ef608fffeDDKiwgOntuAsAr";
+        var realClientRunning = PathProbe.ProcessIds(OpencodeLocator.ProcessName).Count > 0;
+        if (sessions.Count == 0)
+        {
+            // 本机客户端正在跑时，会话行可能还在活动 WAL 里而只读连接看不到（读失败会抛 IoError，这里没有抛）。
+            // 按本用例「本机存在就做，不存在就跳过」的口径：只记录数字，不据此断言「没有会话」，更不据此说注入没生效。
+            r.Step($"    真实库里现在列出 0 个会话（客户端在跑={realClientRunning}）：不断言 >0，也不据此说「注入没生效」；" +
+                   "盘上文件与 instruction_blob 的只读核对照做。");
+            var blobOnly = OpencodeDb.InstructionBlobText(realDb, default);
+            r.Step($"    真实 instruction_blob 仍能读出 {blobOnly.Blobs} 条 / {blobOnly.Text.Length} 字符" +
+                   "（只读连接是通的，空的是会话表这一侧的视图）。");
+            r.Step($"    其中：配置指令层标记命中 {OpencodeMarkers.CountHits(blobOnly.Text, OpencodeMarkers.InstructionsMarkers)} 次，" +
+                   $"系统层标记命中 {OpencodeMarkers.CountHits(blobOnly.Text, OpencodeMarkers.SystemLayerMarkers)} 次，" +
+                   $"载荷层标记命中 {OpencodeMarkers.CountHits(blobOnly.Text, OpencodeMarkers.PayloadMarkers)} 次（只读参考值）");
+        }
+        else
+        {
+            r.Check(sessions.Count > 0, $"真实库里列出 {sessions.Count} 个会话");
+        }
+
         var target = sessions.FirstOrDefault(s => s.Id == realSessionId);
         if (target is null)
         {
@@ -945,6 +1478,12 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         public string ConfigBackup => ConfigFile + ".breach.bak";
         public string AgentsBackup => AgentsFile + ".breach.bak";
         public string InstructionsPath => Path.Combine(Target.Ctx.DataDir, "policy", "opencode-instructions.md");
+        public string SystemTextPath => Path.Combine(Target.Ctx.DataDir, "policy", "opencode.system.md");
+        /// <summary>系统提示词层的注入文本（从沙箱 policy 目录读，和适配器写入 opencode.json 的是同一份）。</summary>
+        public string SystemText => Target.Ctx.Policy.Read(
+            OpencodeTarget.PolicyDefs.First(d => d.Name == OpencodeTarget.SystemPolicyName)) ?? "";
+        public string PayloadText => Target.Ctx.Policy.Read(
+            OpencodeTarget.PolicyDefs.First(d => d.Name == "payload")) ?? "";
     }
 
     private static Env Setup(SelfTestContext ctx, Action<string, string?> setEnv, string name, string? config, string? agents)
@@ -1018,6 +1557,8 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         public required long ExpectedBytes { get; init; }
         public required string InstructionsHash { get; init; }
         public required string EnvHash { get; init; }
+        /// <summary>系统提示词层的 blob（只有用例 14 会加；为 null 表示这个库里没有它）。</summary>
+        public string? SystemHash { get; init; }
 
         public void DeleteBlob(string hash)
         {
@@ -1025,6 +1566,21 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             cmd.CommandText = "DELETE FROM instruction_blob WHERE hash = @h";
             cmd.Parameters.AddWithValue("@h", hash);
             cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>
+        /// 清空会话三张表（session_v2 / session_message / instruction_state），**留着 instruction_blob**：
+        /// 复现「客户端清了会话表，而常驻指令载荷还在库里」这个真实状态——
+        /// 这时「命中 0」不是结论，「无法判定」才是（见用例 15）。
+        /// </summary>
+        public void DeleteSessions()
+        {
+            foreach (var table in new[] { "session_v2", "session_message", "instruction_state" })
+            {
+                using var cmd = Writer.CreateCommand();
+                cmd.CommandText = $"DELETE FROM {table}";
+                cmd.ExecuteNonQuery();
+            }
         }
 
         public int BlobCount()
@@ -1043,7 +1599,7 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         }
     }
 
-    private static DbFixture MakeDb(string dataHome, string instructionsFilePath)
+    private static DbFixture MakeDb(string dataHome, string instructionsFilePath, string? systemText = null)
     {
         Directory.CreateDirectory(dataHome);
         var dbPath = Path.Combine(dataHome, "opencode.db");
@@ -1118,15 +1674,26 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         Exec(connection, "INSERT INTO instruction_blob (hash, value) VALUES (@h, @v)",
             ("@h", envHash), ("@v", envValue));
 
-        var mapping = JsonSerializer.Serialize(new Dictionary<string, string>
+        var mapping = new Dictionary<string, string>
         {
             ["file/opencode-instructions.md"] = instructionsHash,
             ["core/environment"] = envHash,
-        });
+        };
+
+        // 系统提示词层那份载荷（用例 14 才加）：模拟 opencode 把 agent prompt 也装配进常驻指令载荷。
+        string? systemHash = null;
+        if (systemText is not null)
+        {
+            systemHash = Sha256Text(systemText);
+            Exec(connection, "INSERT INTO instruction_blob (hash, value) VALUES (@h, @v)",
+                ("@h", systemHash), ("@v", JsonSerializer.Serialize(systemText)));
+            mapping["agent/build/prompt"] = systemHash;
+        }
+
         Exec(connection,
             "INSERT INTO instruction_state (session_id, epoch_start, through_seq, initial_values, current_values) " +
             "VALUES (@sid, 3, 3, @v, @v)",
-            ("@sid", SessionId), ("@v", mapping));
+            ("@sid", SessionId), ("@v", JsonSerializer.Serialize(mapping)));
 
         return new DbFixture
         {
@@ -1136,6 +1703,7 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             ExpectedBytes = bytes,
             InstructionsHash = instructionsHash,
             EnvHash = envHash,
+            SystemHash = systemHash,
         };
     }
 
@@ -1190,6 +1758,44 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
     {
         using var doc = JsonDocument.Parse(json);
         return doc.RootElement.EnumerateObject().Select(p => p.Name).ToList();
+    }
+
+    /// <summary>从 Changes 里挑出系统提示词层那一条（两条 PolicyText 条目靠 Notes 标题区分）。</summary>
+    private static PlannedChange SysChange(IEnumerable<PlannedChange> changes) =>
+        changes.Last(c => c.Notes.Any(n => n.Title is "系统提示词层" or "系统提示词层还原"));
+
+    /// <summary>读出 agent.&lt;名字&gt;.prompt（不存在 / 非字符串一律给 null）。</summary>
+    private static string? PromptOf(string? json, string agent)
+    {
+        try { return (JsonNode.Parse(json ?? "") as JsonObject)?["agent"]?[agent]?["prompt"]?.GetValue<string>(); }
+        catch { return null; }
+    }
+
+    /// <summary>agent.&lt;名字&gt; 整个对象的规范 JSON（用来比对"别人的字段一个不少"）。</summary>
+    private static string? AgentJson(string? json, string agent)
+    {
+        try { return (JsonNode.Parse(json ?? "") as JsonObject)?["agent"]?[agent]?.ToJsonString(Readable); }
+        catch { return null; }
+    }
+
+    /// <summary>子节点转 JSON 时用的选项：不转义非 ASCII，断言消息里能直接看中文。</summary>
+    private static readonly JsonSerializerOptions Readable = new()
+    {
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    /// <summary>
+    /// agent.&lt;名字&gt; 下**除 prompt 之外**的字段（键 = 规范 JSON 值）。
+    /// 用 JsonNode 取值而不是在文本里 Contains：默认的 ToJsonString 会把中文转义成 \uXXXX，文本包含判断会假失败。
+    /// </summary>
+    private static string OtherFieldsOf(string? json, string agent)
+    {
+        try
+        {
+            if ((JsonNode.Parse(json ?? "") as JsonObject)?["agent"]?[agent] is not JsonObject obj) return "(缺)";
+            return string.Join("|", obj.Where(p => p.Key != "prompt").Select(p => p.Key + "=" + p.Value?.ToJsonString(Readable)));
+        }
+        catch { return "(解析失败)"; }
     }
 
     private static string Sha256Text(string text) =>

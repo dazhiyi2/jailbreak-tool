@@ -31,3 +31,5 @@ out/
 *.log
 Thumbs.db
 desktop.ini
+*-selftest.txt
+baseline-*.txt

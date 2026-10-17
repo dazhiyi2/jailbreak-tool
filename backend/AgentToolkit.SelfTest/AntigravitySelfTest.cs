@@ -113,9 +113,13 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
         r.Step($"真实会话目录（只读比对）：{realConversations}");
         r.Step($"真实安装根（只读比对）：{realInstall}");
 
-        var geminiBefore = SnapshotTree(realGemini);
+        // 快照口径：~/.gemini 下的 conversations\*.db 是 SQLite 库，本自检要用只读连接读它们，
+        // 而只读连接会创建 / 更新 *.db-shm（wal-index 共享内存），所以比对排除 -shm；
+        // -db 与 -wal 是数据本体，仍然逐个 sha256 比对（下面的 DbAndWalDiff 单独再比一次，一条都不放宽）。
+        var geminiBefore = SnapshotTree(realGemini, skipWalIndexShm: true);
         var installBefore = SnapshotTree(realInstall);
-        r.Step($"    快照：~/.gemini {geminiBefore.Count} 个文件、安装根 {installBefore.Count} 个文件");
+        var shmBefore = WalIndexShmCount(realGemini);
+        r.Step($"    快照：~/.gemini {geminiBefore.Count} 个文件（另有 {shmBefore} 个 *.db-shm 不参与比对）、安装根 {installBefore.Count} 个文件");
 
         try
         {
@@ -139,10 +143,16 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
         Case10RealDataReadOnly(ctx, r, realConversations);
 
         // 收尾：真实的 ~/.gemini 与安装目录必须一个字节都没变（自检全程只读它们）。
-        var geminiAfter = SnapshotTree(realGemini);
+        var geminiAfter = SnapshotTree(realGemini, skipWalIndexShm: true);
         var installAfter = SnapshotTree(realInstall);
+        var dbWal = DbAndWalDiff(geminiBefore, geminiAfter);
         r.Check(SameSnapshot(geminiBefore, geminiAfter),
-            $"自检全程没有改动真实 ~/.gemini（{geminiBefore.Count} 个文件，sha256 全部不变）");
+            $"自检全程没有改动真实 ~/.gemini（{geminiBefore.Count} 个文件，sha256 全部不变；" +
+            $"快照排除了 {shmBefore} 个 *.db-shm —— 那是 SQLite 的 wal-index 共享内存文件，任何读者（包括本自检的只读连接）" +
+            "都可能创建 / 更新它，把它算进来等于拿自检自己的足迹当成改动；-db 与 -wal 不在此列，见下一条）");
+        r.Check(dbWal.Changed == 0,
+            $"真实 ~/.gemini 下 {dbWal.Total} 个 *.db / *.db-wal 逐字节不变（未被排除、未放宽）" +
+            (dbWal.Changed == 0 ? "" : $"：变了 {dbWal.Changed} 个（{dbWal.Detail}）"));
         r.Check(SameSnapshot(installBefore, installAfter),
             $"自检全程没有改动真实安装目录（{installBefore.Count} 个文件，sha256 全部不变）");
 
@@ -964,7 +974,8 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
 
         r.Check(ShaShared(realDb) == dbShaBefore, $"真实会话库的 sha256 读前读后不变（{Short(dbShaBefore)}）");
         r.Check(ShaShared(realDb + "-wal") == walShaBefore, "真实会话库的 -wal 读前读后不变");
-        r.Step("    注：-shm 是 SQLite 的 wal-index 共享内存文件，只读连接可能触碰它；本机实测未变，但整套自检的收尾断言是整棵目录树。");
+        r.Step("    注：-shm 是 SQLite 的 wal-index 共享内存文件，只读连接可能创建 / 更新它（本用例上面两条断言只覆盖 -db 与 -wal）；" +
+               "收尾的整棵树快照同样排除 *.db-shm，而 -db / -wal 在那边另有一条逐字节断言。");
         ctx.Log($"real read-only ok: {realSessionId}");
     }
 
@@ -1251,17 +1262,57 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
         catch { return null; }
     }
 
-    private static Dictionary<string, string?> SnapshotTree(string dir)
+    private static Dictionary<string, string?> SnapshotTree(string dir, bool skipWalIndexShm = false)
     {
         var map = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         try
         {
             if (!Directory.Exists(dir)) return map;
             foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                // -shm 是 SQLite 的 wal-index 共享内存文件：WAL 库上**任何读者**（包括本自检的只读连接）
+                // 都可能创建 / 更新它。把它算进"整棵树 sha256 不变"就是把自检自己的足迹当成了别人改的。
+                if (skipWalIndexShm && IsWalIndexShm(f)) continue;
                 map[f] = ShaShared(f);
+            }
         }
         catch { /* 权限 */ }
         return map;
+    }
+
+    /// <summary>SQLite 的 wal-index 共享内存文件（conversations/*.db-shm）。</summary>
+    private static bool IsWalIndexShm(string path) =>
+        path.EndsWith(".db-shm", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// -db 与 -wal 的逐字节比对——**这两类一条都不放宽**：单独再比一次，免得"排除了 -shm"
+    /// 被误读成"整棵树都不比了"。返回（参与比对的文件数，变化项数，变化项清单）。
+    /// </summary>
+    private static (int Total, int Changed, string Detail) DbAndWalDiff(
+        Dictionary<string, string?> before, Dictionary<string, string?> after)
+    {
+        var keys = before.Keys
+            .Where(k => k.EndsWith(".db", StringComparison.OrdinalIgnoreCase) ||
+                        k.EndsWith(".db-wal", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(k => k, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var changed = new List<string>();
+        foreach (var k in keys)
+        {
+            if (!after.TryGetValue(k, out var v)) { changed.Add(Path.GetFileName(k) + "（消失）"); continue; }
+            if (!string.Equals(before[k], v, StringComparison.Ordinal)) changed.Add(Path.GetFileName(k));
+        }
+        return (keys.Length, changed.Count, string.Join("、", changed.Take(5)));
+    }
+
+    private static int WalIndexShmCount(string dir)
+    {
+        try
+        {
+            if (!Directory.Exists(dir)) return 0;
+            return Directory.EnumerateFiles(dir, "*.db-shm", SearchOption.AllDirectories).Count();
+        }
+        catch { return 0; }
     }
 
     private static bool SameSnapshot(Dictionary<string, string?> a, Dictionary<string, string?> b)

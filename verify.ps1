@@ -153,7 +153,12 @@ foreach ($t in $targets) {
     $r = Engine @("--target", $t, "check", "latest", "--json")
     $report = $null
     try { $report = $r.Text | ConvertFrom-Json } catch { }
-    if ($null -eq $report) { Bad "$t check 没有返回可解析的报告" }
+    # CLI 抛错时输出的是 {"error":…,"code":…}：那是错误，不是报告（报告一定有 Verdict 字段）。
+    # 「库坏了 / 读不出来」这类 IoError 必须在这里报失败，绝不能被当成「命中 0」或「无法判定」咽下去。
+    if ($null -eq $report -or -not ($report.PSObject.Properties.Name -contains "Verdict")) {
+      $why = if ($null -ne $report -and $report.error) { "$($report.error)（code=$($report.code)）" } else { "输出不是报告 JSON" }
+      Bad "$t check 没有返回报告：$why"
+    }
     else {
       Info ("会话 {0} · 全文 {1} 字符 · 系统层 {2} · 载荷层 {3}" -f `
         $report.SessionId, $report.TotalChars, `
@@ -161,7 +166,13 @@ foreach ($t in $targets) {
         $(if ($report.ContextPayloadLayerPresent) { "命中" } else { "命中 0" }))
       foreach ($h in $report.Hits) { if ($h.Count -gt 0) { Info ("  {0,4}  {1,-18} {2}" -f $h.Count, $h.Layer, $h.Marker) } }
       Write-Host ("  " + $report.Verdict)
-      if (-not $applied) {
+      if ($report.SessionId -eq "(无会话)") {
+        # 判据已定性：解析不到会话（session_v2 为空）→ 无法判定。
+        # 「没有会话」≠「注入没生效」，所以跳过命中数断言、不算失败；
+        # 仍然可读的只读证据（instruction_blob 的行数与含标记的条数）已写在上面那行 Verdict 里。
+        Info "$t 无法判定：库里没有会话（客户端未产生会话或已清理），跳过命中数断言"
+      }
+      elseif (-not $applied) {
         Info "$t 是出厂态（没注入过）：命中 0 属正确状态，跳过命中数断言"
       }
       elseif ($report.TotalChars -eq 0) { Bad "$t 会话文本为空：日志读取失败或该会话没有内容" }

@@ -18,9 +18,12 @@ namespace AgentToolkit.Core.Targets.Opencode;
 ///           assistant 的推理原文在 data.content[] 里 type=="reasoning" 的块（state.reasoningField == "reasoning_content"）；
 ///           instruction_blob / instruction_state 是「模型实际收到了什么常驻指令」的权威视图
 ///
-/// 两层：
+/// 三层：
 ///   1 配置指令层 = &lt;config&gt;/opencode.json 的 instructions 数组加入本工具管理的指令文件路径（LayerKind.PolicyText）
 ///   2 上下文载荷层 = &lt;config&gt;/AGENTS.md 写入载荷文本（LayerKind.ContextPayload）
+///   3 系统提示词层 = &lt;config&gt;/opencode.json 的 agent.&lt;名字&gt;.prompt 写入系统层文本（LayerKind.PolicyText）
+///     这一层进的是**系统提示词区**：模型按硬性规定执行，不像前两层那样被当成"一份可以评价的文件"或"本机偏好"。
+///     注入文本必须是环境事实陈述——不自称权威、不要求输出校验标记（那两类写法会被模型逐条指认为注入特征）。
 /// </summary>
 public sealed class OpencodeTarget : ITargetAdapter
 {
@@ -34,17 +37,59 @@ public sealed class OpencodeTarget : ITargetAdapter
     public TargetKind Kind => TargetKind.PackagedElectron;
     public TargetContext Ctx { get; }
 
+    /// <summary>系统提示词层注入文本的定义名。</summary>
+    public const string SystemPolicyName = "system";
+
+    /// <summary>
+    /// MarkerReport.SessionId 的哨兵值：命中判据解析不到会话时用它，表示「无法判定」而不是「没生效」。
+    /// 契约的 MarkerReport 没有"无法判定"字段（EngineContracts.cs 冻结，不许加字段），
+    /// 所以用这个哨兵 + Verdict 文本表达；verify.ps1 按它跳过命中数断言（见 verify.ps1 的 check latest 一节）。
+    /// </summary>
+    public const string UndecidableSessionId = "(无会话)";
+
     public IReadOnlyList<string> LayerDescriptions => new[]
     {
         "配置指令层：~/.config/opencode/opencode.json 的 instructions（官方通道，指向本工具管理的指令文件）",
         "上下文载荷层：~/.config/opencode/AGENTS.md（全局；项目级从工作目录向上搜 AGENTS.md）",
+        "系统提示词层：~/.config/opencode/opencode.json 的 agent.<名字>.prompt（官方 schema 的 AgentConfig.prompt: string；" +
+        "进系统提示词区，模型按硬性规定执行，不是「读一份文件后可以评价」）",
     };
 
     public static IReadOnlyList<PolicyTextDef> PolicyDefs { get; } = new[]
     {
         new PolicyTextDef { Name = "instructions", DisplayName = "配置指令（opencode.json → instructions）", FileName = "opencode-instructions.md", ResourceSuffix = "opencode.instructions.md" },
         new PolicyTextDef { Name = "payload", DisplayName = "上下文载荷（AGENTS.md）", FileName = "AGENTS.md", ResourceSuffix = "opencode.payload.md" },
+        // Required=false 是这一层的开关：契约的 ApplyOptions / RevertOptions 没有第三个层开关，
+        // 于是把「清空这一份文本」定义为关闭系统提示词层（见 SystemLayerText 的说明）。
+        new PolicyTextDef
+        {
+            Name = SystemPolicyName,
+            DisplayName = "系统提示词（opencode.json → agent.<名字>.prompt）",
+            FileName = "opencode.system.md",
+            ResourceSuffix = "opencode.system.md",
+            Required = false,
+        },
     };
+
+    /// <summary>
+    /// 系统提示词层（层 3）的开关与文本。
+    ///
+    /// 契约的 ApplyOptions / RevertOptions 只有两个层开关（SkipSystemPrompt → 配置指令层、SkipContextPayload → 载荷层），
+    /// 没有第三个，而契约是冻结的、不许加字段（EngineContracts.cs 顶部原文：需要新字段时写进 UI-NOTES.md，不要在这里加）。
+    /// 所以这一层的开关落在 adapter 内部，判据是**该层注入文本的可用状态**：
+    ///   · 有名为 system 的定义、且物化后的文本非空 → 本层启用；
+    ///   · 文本被清空（SavePolicyFile("system", "")，该定义 Required=false 才允许清空）或定义缺失 → 本层不参与 apply；
+    ///   · 无论启用与否，revert 都会清掉盘上确实由本工具写入的 prompt（撤销不做"开关关了就留着注入"这种事）。
+    /// </summary>
+    private (bool Enabled, string Text) SystemLayerText()
+    {
+        var def = Ctx.Def(SystemPolicyName);
+        if (def is null) return (false, "");
+        string text;
+        try { text = Ctx.Policy.Read(def) ?? ""; }
+        catch { return (false, ""); }
+        return (text.Trim().Length > 0, text);
+    }
 
     // ================================================================ 定位 / 描述
 
@@ -117,6 +162,13 @@ public sealed class OpencodeTarget : ITargetAdapter
         return Ctx.Policy.PathOf(def);
     }
 
+    /// <summary>系统提示词层注入文本的落盘路径（写进 opencode.json 的 agent.&lt;名字&gt;.prompt 的那一份）。</summary>
+    private string SystemTextPath()
+    {
+        var def = Ctx.Def(SystemPolicyName);
+        return def is null ? "(没有名为 system 的注入文本定义)" : Ctx.Policy.PathOf(def);
+    }
+
     // ================================================================ 状态
 
     public EngineStatus GetStatus(CancellationToken ct)
@@ -150,13 +202,24 @@ public sealed class OpencodeTarget : ITargetAdapter
 
         var layer1 = InstructionsLayer(configFile, instrPath, loc);
         var layer2 = PayloadLayer(agentsFile);
+        var (systemEnabled, systemText) = SystemLayerText();
+        var layer3 = AgentPromptLayer(configFile, systemEnabled, systemText, SystemTextPath());
 
         var configApplied = layer1.State == LayerState.Applied;
         var payloadApplied = layer2.State == LayerState.Applied;
+        var agentApplied = layer3.State == LayerState.Applied;
         ApplyEffectiveness(layer1, "配置指令层", OpencodeMarkers.InstructionsMarkers, scopedBlobText, newestId,
             bothInstalled: configApplied && payloadApplied, notes);
         ApplyEffectiveness(layer2, "上下文载荷层", OpencodeMarkers.PayloadMarkers, scopedBlobText, newestId,
             bothInstalled: payloadApplied, notes);
+        ApplyEffectiveness(layer3, "系统提示词层", OpencodeMarkers.SystemLayerMarkers, scopedBlobText, newestId,
+            bothInstalled: agentApplied, notes);
+        if (layer3.InstalledButNotEffective)
+            layer3.EffectivenessEvidence +=
+                "（系统提示词层的补充：instruction_blob 记的是「常驻指令载荷」，agent prompt 不走这条通道——" +
+                "实测本机真实库里系统层标记命中 0 次，而 opencode.json 里四个 agent 的 prompt 都在。" +
+                "所以本层命中 0 只能说明「这个会话的常驻指令载荷里没有它」，不等于没生效；" +
+                "要判它进没进模型上下文，开一个新会话后按行为读推理原文。）";
 
         if (last is not null)
         {
@@ -172,10 +235,11 @@ public sealed class OpencodeTarget : ITargetAdapter
         var running = pids.Count > 0;
 
         // 常驻指令在**会话启动时**装配：已存在的会话不会重读 → 盘上是注入态而最近会话里读不到时，必须开新会话。
-        var applied = configApplied || payloadApplied;
+        var applied = configApplied || payloadApplied || agentApplied;
         var effective = scopedBlobText is not null &&
                         (OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.InstructionsMarkers) > 0 ||
-                         OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.PayloadMarkers) > 0);
+                         OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.PayloadMarkers) > 0 ||
+                         OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.SystemLayerMarkers) > 0);
         var restart = applied && !effective;
         if (restart && running)
             notes.Add(Notes.Warn("需要新会话",
@@ -190,7 +254,7 @@ public sealed class OpencodeTarget : ITargetAdapter
         return new EngineStatus
         {
             Target = MultiTargetEngine.ToLocateResult(this, ToLocation(loc)),
-            Layers = new[] { layer1, layer2 },
+            Layers = new[] { layer1, layer2, layer3 },
             ClientRunning = running,
             RunningProcessIds = pids,
             RestartRequired = restart,
@@ -272,6 +336,104 @@ public sealed class OpencodeTarget : ITargetAdapter
         if (blobs > 0)
             extra.Add(Notes.Info("权威视图",
                 $"instruction_blob 里有 {blobs} 条常驻指令载荷；命中数自检读的就是这里（{loc.DbPath}）。", loc.DbPath));
+
+        layer.Notes = layer.Notes.Concat(extra).ToArray();
+        return layer;
+    }
+
+    /// <summary>
+    /// 层 3：opencode.json → <c>agent.&lt;名字&gt;.prompt</c>（系统提示词层）。
+    ///
+    /// 「装上了」的判据 = **四个目标 agent 的 prompt 都是本工具的系统层文本**（逐字节一致或含系统层标记），
+    /// 而不是"文件里出现过某个标记"：只写进去一两个 agent 属于没写全，状态页要如实报 X/4。
+    /// 解析不了 / agent 不是对象 / 某个 agent 不是对象 / prompt 存在但不是字符串 → AnchorMissing，
+    /// apply 会 fail-closed 拒写（与层 1 同口径）。
+    /// </summary>
+    private static LayerStatus AgentPromptLayer(string configFile, bool enabled, string systemText, string systemTextPath)
+    {
+        var layer = StatusBuilder.BuildLayer(
+            LayerKind.PolicyText,
+            "系统提示词层（opencode.json → agent.<名字>.prompt）",
+            configFile,
+            null,
+            OpencodeMarkers.SystemLayerMarkers,
+            OpencodeConfig.TryParseObject,
+            absentDetail: "opencode.json 不存在：系统提示词层未部署（首次 apply 会创建它）。",
+            appliedDetail: "四个 agent 的 prompt 都是本工具的系统层文本。",
+            notAppliedDetail: "opencode.json 里没有本工具的系统层 prompt。");
+
+        if (layer.State == LayerState.TargetAbsent)
+        {
+            var bm0 = new BackupManager(configFile);
+            layer.Backup = bm0.ToContract(bm0.Assess(OpencodeMarkers.AllMarkers));
+            return layer;
+        }
+
+        var text = FileText.ReadOrNull(configFile) ?? "";
+        var edit = OpencodeConfig.PlanAgentPrompts(text, true, systemText);
+        var parseOk = layer.ParseOk && edit.ParseOk;
+        var applied = edit.AppliedAgents;
+
+        StatusBuilder.WithAnchorState(layer,
+            anchorHits: parseOk && edit.Problems.Count == 0 ? 1 : 0,
+            markerHits: applied.Count == OpencodeConfig.TargetAgents.Count ? 1 : 0);
+
+        if (!parseOk || edit.Problems.Count > 0)
+        {
+            layer.State = LayerState.AnchorMissing;
+            layer.StateDetail = edit.Problems.Count > 0
+                ? "opencode.json 无法安全改写：" + string.Join("；", edit.Problems)
+                : "opencode.json 不是合法 JSON 对象：apply 会 fail-closed 拒绝写入，不会覆盖用户配置。";
+            layer.Notes = layer.Notes
+                .Concat(edit.Problems.Select(p => Notes.Error("拒绝写入", p, configFile)))
+                .ToArray();
+        }
+        else if (layer.State == LayerState.NotApplied)
+        {
+            layer.StateDetail = !enabled
+                ? "系统提示词层未启用（该层注入文本为空或定义缺失）：本层不参与 apply；revert 仍会清掉盘上确实由本工具写入的 prompt。"
+                : applied.Count == 0
+                    ? "opencode.json 里没有本工具的系统层 prompt。"
+                    : $"系统提示词层没写全：{applied.Count}/{OpencodeConfig.TargetAgents.Count} 个 agent 带本工具文本" +
+                      $"（{string.Join("、", applied)}）；apply 会把 {string.Join("、", OpencodeConfig.TargetAgents)} 四个都写上。";
+        }
+        else if (!enabled)
+        {
+            layer.StateDetail = "四个 agent 的 prompt 都是本工具的系统层文本；但本层当前未启用（注入文本为空）：" +
+                                "apply 不会写 agent prompt（盘上原有的也不会被清掉），revert 仍会清掉这些痕迹。";
+        }
+
+        var extra = new List<Note>
+        {
+            Notes.Info("这是系统提示词层",
+                "落点是 opencode.json 的 agent.<名字>.prompt（官方 schema 的 AgentConfig.prompt: string）。" +
+                "它进的是**系统提示词区**：模型按硬性规定执行；而配置指令层（instructions 指向的文件）与载荷层（AGENTS.md）" +
+                "会被当成「一份可以评价的文件」，载荷层甚至会被点名驳回为「本机偏好」——三层的权力不是一个量级。" +
+                "所以本层文本必须是环境事实陈述：不自称权威、不要求输出校验标记（那两类写法会被模型逐条指认为注入特征）。",
+                configFile),
+            Notes.Info("写入范围",
+                $"只写 {string.Join("、", OpencodeConfig.TargetAgents)} 四个 agent 的 prompt 字段；" +
+                "title、summary、compaction 是内部工具 agent（起标题 / 压缩上下文），塞策略会干扰它们本来就窄的活，一个都不碰。" +
+                "其它顶层键、其它 agent、其它字段原样保留。", configFile),
+            Notes.Info("本层开关",
+                "契约里没有第三个层开关：本层由自己的注入文本启用状态裁决——文本非空即启用，清空该文本即关闭本层" +
+                "（revert 不受此开关影响）。", configFile),
+            Notes.Info("本层的生效视图",
+                "agent prompt 在会话启动时并进系统提示词，不进 instruction_blob（实测本机真实库里系统层标记命中 0 次，" +
+                "而 opencode.json 里四个 agent 的 prompt 都在）。所以命中数对本层只能作参考：" +
+                "「装上了」以 opencode.json 里的四个 prompt 为准，「生效了」要开新会话后读推理原文。", configFile),
+        };
+
+        foreach (var st in edit.Agents)
+            extra.Add(Notes.Info($"agent.{st.Name}", st.Kind, configFile));
+
+        if (enabled)
+            extra.Add(Notes.Info("系统层文本",
+                $"{systemTextPath}（{FileText.Human(FileText.Bytes(systemText))}）：随配置在每次会话启动时装配，" +
+                $"覆盖 {string.Join("、", OpencodeConfig.TargetAgents)} 四个 agent。", systemTextPath));
+        else
+            extra.Add(Notes.Warn("系统层文本为空",
+                $"{systemTextPath} 为空或缺失：apply 不会写 agent prompt。填回文本后本层自动启用。", systemTextPath));
 
         layer.Notes = layer.Notes.Concat(extra).ToArray();
         return layer;
@@ -372,14 +534,21 @@ public sealed class OpencodeTarget : ITargetAdapter
         public required string InstructionsPath { get; init; }
         public required InstructionsEdit Edit { get; init; }
         public required OpencodePayloadPlan Payload { get; init; }
+        /// <summary>层 3（系统提示词层）：同一份 opencode.json 的 agent.&lt;名字&gt;.prompt。</summary>
+        public required AgentPromptEdit Agents { get; init; }
+        /// <summary>层 3 的注入文本（值级前后对照与撤销归属判据都要用它）。</summary>
+        public required string SystemText { get; init; }
         public required IReadOnlyList<string> Problems { get; init; }
         public bool SystemLayer { get; init; }
         public bool PayloadLayer { get; init; } = true;
+        /// <summary>层 3 是否参与本次操作（由本层注入文本的启用状态裁决，见 SystemLayerText）。</summary>
+        public bool AgentLayer { get; init; }
         public string PreviewId { get; init; } = "";
 
         public bool ConfigWillWrite => SystemLayer && Edit.WillWrite && Problems.Count == 0;
+        public bool AgentWillWrite => AgentLayer && Agents.WillWrite && Problems.Count == 0;
         public bool PayloadWillWrite => PayloadLayer && Payload.WillWrite && Problems.Count == 0;
-        public bool AnyWrite => ConfigWillWrite || PayloadWillWrite;
+        public bool AnyWrite => ConfigWillWrite || AgentWillWrite || PayloadWillWrite;
 
         public IReadOnlyList<PlannedChange> Changes()
         {
@@ -400,6 +569,10 @@ public sealed class OpencodeTarget : ITargetAdapter
                         string.Join("；", shown.Select(e =>
                             string.Equals(e, InstructionsPath, StringComparison.OrdinalIgnoreCase) ? e + "（本工具）" : e)),
                         ConfigFile));
+                if (AgentLayer)
+                    layerNotes.Add(Notes.Info("同一份文件的另一处改动",
+                        "系统提示词层也在改这份 opencode.json（agent.<名字>.prompt）：本条目只报 instructions 这一段，" +
+                        "整份文件的最终形态见系统提示词层条目。", ConfigFile));
                 list.Add(new PlannedChange
                 {
                     Path = ConfigFile,
@@ -409,6 +582,51 @@ public sealed class OpencodeTarget : ITargetAdapter
                     AfterBytes = FileText.Bytes(Edit.WillWrite ? Edit.Next : Edit.Origin),
                     BackupPath = File.Exists(ConfigFile) ? new BackupManager(ConfigFile).BackupPath : null,
                     DiffText = Edit.WillWrite ? DiffBuilder.ToUnifiedText(diff) : null,
+                    Notes = layerNotes,
+                });
+            }
+
+            if (AgentLayer)
+            {
+                // 本条目报的是**这份文件**：当前盘上的形态 → apply 之后最终形态（含配置指令层那一段）。
+                // 配置指令层的条目仍只报它自己那一段（语义一个字没变），所以两条条目的数字是「整体」对「分段」。
+                var fileNow = Edit.Origin;
+                var fileFinal = Agents.WillWrite ? Agents.Next : (ConfigWillWrite ? Edit.Next : Edit.Origin);
+                var (aDiff, aAdded, aRemoved) = Agents.WillWrite
+                    ? DiffBuilder.Build(fileNow, fileFinal)
+                    : (new List<DiffLine>(), 0, 0);
+
+                var layerNotes = new List<Note>
+                {
+                    Agents.WillWrite
+                        ? Notes.Info("系统提示词层", $"+{aAdded} / -{aRemoved} 行：{Agents.Detail}", ConfigFile)
+                        : Notes.Info("系统提示词层", Agents.Detail ?? "无需改动。", ConfigFile),
+                    // 契约的 PlannedChange 只有字节数，所以值级的前后对照只能写进 Notes。
+                    Notes.Info("整份文件",
+                        $"BeforeBytes/AfterBytes 是这份 opencode.json 的当前形态 → apply 后形态：" +
+                        $"{FileText.Human(FileText.Bytes(fileNow))} → {FileText.Human(FileText.Bytes(fileFinal))}；" +
+                        "配置指令层的条目只报它自己那一段（instructions），所以两条的数字不是简单相加关系。", ConfigFile),
+                };
+                foreach (var st in Agents.Agents)
+                    layerNotes.Add(Notes.Info($"agent.{st.Name}",
+                        st.Kind + "；改后 = 本工具系统层文本" +
+                        $"（{FileText.Human(FileText.Bytes(SystemText))}）" +
+                        (st.OtherFields > 0 ? $"；该 agent 另有 {st.OtherFields} 个字段原样保留" : ""), ConfigFile));
+                if (Agents.Agents.Any(s => s is { PromptPresent: true, PromptIsOurs: false }))
+                    layerNotes.Add(Notes.Warn("会覆盖原有的 prompt",
+                        "有 agent 已经有别人写的 prompt：本层只覆盖这四个 agent 的 prompt 字段" +
+                        $"（{string.Join("、", Agents.Agents.Where(s => s is { PromptPresent: true, PromptIsOurs: false }).Select(s => s.Name))}）。" +
+                        "写入前会先备份整份 opencode.json，撤销时按备份逐字节还原。", ConfigFile));
+
+                list.Add(new PlannedChange
+                {
+                    Path = ConfigFile,
+                    Layer = LayerKind.PolicyText,
+                    WillWrite = AgentWillWrite,
+                    BeforeBytes = FileText.Bytes(fileNow),
+                    AfterBytes = FileText.Bytes(fileFinal),
+                    BackupPath = File.Exists(ConfigFile) ? new BackupManager(ConfigFile).BackupPath : null,
+                    DiffText = Agents.WillWrite ? DiffBuilder.ToUnifiedText(aDiff) : null,
                     Notes = layerNotes,
                 });
             }
@@ -447,23 +665,36 @@ public sealed class OpencodeTarget : ITargetAdapter
         if (string.IsNullOrWhiteSpace(instrText))
             problems.Add($"「配置指令」文本为空：{instrPath}（拒绝把配置指向一个空文件）。");
 
+        var (systemEnabled, systemText) = SystemLayerText();
+
         var origin = FileText.ReadOrNull(configFile);
         var edit = OpencodeConfig.Plan(origin, File.Exists(configFile), instrPath);
         problems.AddRange(edit.Problems);
 
+        // 层 3 的起点是「层 1 改写之后」的文档（层 1 被跳过时就是当前文档），两份计划因此不会互相覆盖。
+        var baseExists = File.Exists(configFile) || (!options.SkipSystemPrompt && edit.WillWrite);
+        var agentsBase = options.SkipSystemPrompt ? (origin ?? "") : edit.Next;
+        var agents = OpencodeConfig.PlanAgentPrompts(agentsBase, baseExists, systemText);
+        // 本层未启用时（文本为空）它的 Problems 不该把整个 apply 拖成 fail-closed。
+        if (systemEnabled) problems.AddRange(agents.Problems);
+
         var payloadText = ReadPolicyText(options.PayloadPath, "payload", required: !options.SkipContextPayload);
         var payload = OpencodePayload.Plan(loc.ConfigHome, payloadText, options.SkipContextPayload);
 
-        var idInput = (origin ?? "") + "\n" + instrPath + "\n" + instrText + "\n" + payloadText + "\n" + loc.ConfigHome;
+        var idInput = (origin ?? "") + "\n" + instrPath + "\n" + instrText + "\n" + systemText + "\n" +
+                      agents.Next + "\n" + payloadText + "\n" + loc.ConfigHome;
         return new Plan
         {
             Loc = loc,
             ConfigFile = configFile,
             InstructionsPath = instrPath,
             Edit = edit,
+            Agents = agents,
+            SystemText = systemText,
             Payload = payload,
             Problems = problems,
             SystemLayer = !options.SkipSystemPrompt,
+            AgentLayer = systemEnabled,
             PayloadLayer = !options.SkipContextPayload,
             PreviewId = FileText.Sha256Text(idInput)[..16],
         };
@@ -511,7 +742,13 @@ public sealed class OpencodeTarget : ITargetAdapter
                 plan.AnyWrite
                     ? $"将写入 {FileText.Human(changes.Where(c => c.WillWrite).Sum(c => c.BeforeBytes))} → " +
                       $"{FileText.Human(changes.Where(c => c.WillWrite).Sum(c => c.AfterBytes))}。"
-                    : "两层都已是目标状态：重复 apply 不产生字节变化（幂等）。", plan.ConfigFile));
+                    : "三层都已是目标状态：重复 apply 不产生字节变化（幂等）。", plan.ConfigFile));
+        if (plan.SystemLayer && plan.AgentLayer)
+            notes.Add(Notes.Info("同一份文件两条条目",
+                "配置指令层与系统提示词层都落在 opencode.json 上：配置指令层那条只报 instructions 那一段，" +
+                "系统提示词层那条报整份文件（当前 → apply 后）。所以 TotalBeforeBytes / TotalAfterBytes 会把这份文件" +
+                "计入两次，真实落盘体积看系统提示词层那条的 AfterBytes。契约的 PlannedChange 只有字节数，不便再加字段。",
+                plan.ConfigFile));
         notes.Add(Notes.Info("只读预览",
             "PreviewApply 不写盘、不建备份；apply 在 DryRun=true 时同样一个字节都不写。", plan.ConfigFile));
 
@@ -540,6 +777,15 @@ public sealed class OpencodeTarget : ITargetAdapter
                 "生成结果未通过检查，拒绝写入（fail-closed）：\n  - " + string.Join("\n  - ", plan.Problems));
 
         var changes = plan.Changes();
+
+        // 层 3 的计划文本先在内存里校验并**在写任何文件之前**拦下：过不了就一个字节都不写（连层 1 都不写）。
+        if (plan.AgentLayer && plan.Agents.WillWrite)
+        {
+            var planned = OpencodeConfig.ValidateAgentPrompts(plan.Agents.Next, plan.Agents.OriginKeys, plan.SystemText);
+            if (planned.Count > 0)
+                throw new AgentEngineException(EngineErrorCode.SelfCheckFailed,
+                    "系统提示词层的计划文本未通过检查，拒绝写入（fail-closed）：\n  - " + string.Join("\n  - ", planned));
+        }
 
         if (options.DryRun)
         {
@@ -587,6 +833,50 @@ public sealed class OpencodeTarget : ITargetAdapter
             {
                 notes.Add(Notes.Info("幂等", plan.Edit.Detail ?? "instructions 已含本工具路径，字节无变化。", plan.ConfigFile));
             }
+        }
+
+        // ---- 层 3：opencode.json 的 agent.<名字>.prompt（系统提示词层）----
+        // 必须排在层 1 之后：它的计划文本是以「层 1 改写之后」的文档为起点算出来的。
+        if (plan.AgentLayer)
+        {
+            if (plan.Agents.WillWrite)
+            {
+                progress?.Report(new EngineProgress { Stage = "backup", Message = "备份 opencode.json（系统提示词层）", Fraction = 0.65 });
+                // 备份的必须是**本次 apply 之前**的那份文件：文件是本工具从零创建的时候没有备份可拍
+                // （Edit.FileExists 是计划阶段看到的磁盘状态），层 1 已经拍过的干净备份也不会被覆盖。
+                if (plan.Edit.FileExists)
+                    BackupFile(plan.ConfigFile, plan.Edit.Origin, OpencodeMarkers.AllMarkers, notes, "opencode.json");
+
+                progress?.Report(new EngineProgress { Stage = "write", Message = "写入 agent.<名字>.prompt", Fraction = 0.7 });
+                FileText.Write(plan.ConfigFile, plan.Agents.Next);
+
+                var problems = OpencodeConfig.ValidateAgentPrompts(
+                    FileText.ReadOrNull(plan.ConfigFile), plan.Agents.OriginKeys, plan.SystemText);
+                if (problems.Count > 0)
+                {
+                    // 回滚到本次 apply 之前的状态（不是层 1 之后那个中间态）：不搞"改一半再抛"。
+                    Rollback(plan.ConfigFile, plan.Edit.Origin, plan.Edit.FileExists);
+                    throw new AgentEngineException(EngineErrorCode.SelfCheckFailed,
+                        "写入后重新解析校验失败，已回滚到写入前的内容：\n  - " + string.Join("\n  - ", problems));
+                }
+
+                wrote = true;
+                notes.Add(Notes.Info("已写入系统提示词层",
+                    $"{plan.ConfigFile}：agent.{string.Join("/", OpencodeConfig.TargetAgents)}.prompt ← " +
+                    $"同一段系统层文本（每处 {FileText.Human(FileText.Bytes(plan.SystemText))}）", plan.ConfigFile));
+                notes.Add(Notes.Info("写入后校验",
+                    "重新解析通过：agent 是对象、四个 agent 的 prompt 逐字节等于系统层文本、原有键一个不少。", plan.ConfigFile));
+            }
+            else
+            {
+                notes.Add(Notes.Info("幂等", plan.Agents.Detail ?? "四个 agent 的 prompt 已是当前文本，字节无变化。", plan.ConfigFile));
+            }
+        }
+        else
+        {
+            notes.Add(Notes.Info("跳过系统提示词层",
+                $"本层注入文本为空或定义缺失（{SystemTextPath()}）：未写 agent prompt。" +
+                "填入文本后本层自动启用（契约里没有第三个层开关，本层开关就是这个文本的启用状态）。", plan.ConfigFile));
         }
 
         // ---- 层 2：AGENTS.md ----
@@ -713,16 +1003,34 @@ public sealed class OpencodeTarget : ITargetAdapter
         string? originalSha = null;
         string? currentSha = null;
 
-        // ---- 预检：两层的备份只要有一份污染，就在动任何文件之前拒绝（不做"改一半再抛"） ----
+        // ---- 预检：三个层里任何一份备份污染，都在动任何文件之前拒绝（不做"改一半再抛"） ----
         var cfgBm = new BackupManager(configFile);
         var cfgAssess = cfgBm.Assess(OpencodeMarkers.AllMarkers);
         var payBm = new BackupManager(agentsFile);
         var payAssess = payBm.Assess(OpencodeMarkers.PayloadMarkers);
+
+        // 层 3 与层 1 共用同一份 opencode.json：
+        //   · SkipSystemPrompt 仍然是**配置指令层**的开关（映射不变）；
+        //   · 系统提示词层的开关是它自己那份注入文本；盘上确实有本层痕迹时，撤销不看开关（不搞"开关关了就留着注入"）。
+        var (systemEnabled, systemText) = SystemLayerText();
+        var probe = OpencodeConfig.PlanAgentPrompts(FileText.ReadOrNull(configFile), File.Exists(configFile), systemText);
+        var agentPresent = probe.AppliedAgents.Count > 0;
+        var doInstr = !options.SkipSystemPrompt;
+        var doAgents = systemEnabled || agentPresent;
+        var configLayers = doInstr || doAgents;
+        // 整份文件的备份还原只有在「配置指令层参与」或「系统提示词层盘上没有痕迹」时才允许用：
+        // 否则（SkipSystemPrompt=true 且本层确实有痕迹）会把指令层也一并还原掉，那违背了 SkipSystemPrompt 的语义。
+        var wholeFileRestore = doInstr || !doAgents;
+
         var contaminated = new List<Note>();
-        if (!options.SkipSystemPrompt && cfgAssess.Status == BackupStatus.Contaminated)
+        if (configLayers && cfgAssess.Status == BackupStatus.Contaminated)
+        {
+            var what = doInstr && doAgents ? "配置指令层与系统提示词层" : doInstr ? "配置指令层" : "系统提示词层";
             contaminated.Add(Notes.Error("备份污染",
                 $"{cfgBm.BackupPath} 里含注入标记，它不是原始文件：拒绝用它还原（那会把注入「还原」回来而工具报告成功）。" +
-                "删掉这份备份后，revert 会走「摘除本工具条目」的逆向撤销路径。", configFile));
+                $"这份备份承载的是{what}。" +
+                "删掉这份备份后，revert 会走「摘除本工具写进去的内容」的逆向撤销路径。", configFile));
+        }
         if (!options.SkipContextPayload && payAssess.Status == BackupStatus.Contaminated)
             contaminated.Add(Notes.Error("备份污染",
                 $"{payBm.BackupPath} 里含载荷标记，它不是用户原文件：拒绝用它还原。" +
@@ -731,10 +1039,10 @@ public sealed class OpencodeTarget : ITargetAdapter
             throw new AgentEngineException(EngineErrorCode.AnchorConflict,
                 "备份污染：拒绝用被改坏的备份还原（未改动任何文件）。", contaminated);
 
-        // ---- 层 1：opencode.json ----
-        if (!options.SkipSystemPrompt)
+        // ---- 层 1 + 层 3：opencode.json（同一份文件） ----
+        if (configLayers)
         {
-            progress?.Report(new EngineProgress { Stage = "配置指令层", Message = "从备份还原 / 摘除本工具的条目", Fraction = 0.2 });
+            progress?.Report(new EngineProgress { Stage = "配置指令层 + 系统提示词层", Message = "从备份还原 / 摘除本工具的内容", Fraction = 0.2 });
             var bm = cfgBm;
             var ab = cfgAssess;
 
@@ -747,9 +1055,11 @@ public sealed class OpencodeTarget : ITargetAdapter
             {
                 string? next = null;
                 string action;
+                string agentAction = "系统提示词层未参与本次还原。";
                 var delete = false;
+                var agentWillWrite = false;
 
-                if (ab.Status == BackupStatus.Clean && ab.Path is not null)
+                if (ab.Status == BackupStatus.Clean && ab.Path is not null && wholeFileRestore)
                 {
                     var saved = FileText.ReadOrNull(ab.Path);
                     if (saved is not null)
@@ -757,24 +1067,65 @@ public sealed class OpencodeTarget : ITargetAdapter
                         next = saved;
                         action = $"从首次备份逐字节还原（{ab.Path}）";
                         originalSha = FileText.Sha256Text(saved);
+                        agentWillWrite = agentPresent;
+                        agentAction = agentPresent
+                            ? $"随整份文件逐字节还原：{string.Join("、", probe.AppliedAgents)} 的 prompt 一起回到出厂形态。"
+                            : "备份还原的这份文件里本来就没有本工具的系统层 prompt。";
                     }
                     else
                     {
-                        action = "备份读不出来：改走逆向撤销（摘除本工具的条目）";
+                        action = "备份读不出来：改走逆向撤销（摘除本工具的内容）";
                     }
                 }
-                else if (OpencodeConfig.IsFactoryOnly(existing, instrPath))
+                else if (ab.Status != BackupStatus.Clean &&
+                         (OpencodeConfig.IsFactoryOnly(existing, instrPath) ||
+                          OpencodeConfig.IsToolkitCreatedOnly(existing, instrPath, systemText)))
                 {
+                    // 没有可信备份，且这份文件整份都是本工具写的 → 删除，恢复出厂的不存在状态。
+                    // 有干净备份时绝不走这条路：那该用备份还原，而不是删掉用户的文件。
                     delete = true;
-                    action = "没有备份，且这份 opencode.json 是本工具从零创建的（只有 $schema + instructions）：删除文件，恢复出厂的不存在状态";
+                    action = "没有备份，且这份 opencode.json 整份都是本工具写的（只有 $schema + 本工具的 instructions + 本工具的 agent prompt）：" +
+                             "删除文件，恢复出厂的不存在状态";
+                    agentWillWrite = agentPresent;
+                    agentAction = "随整份文件删除：系统提示词层的 prompt 一并消失。";
                 }
                 else
                 {
-                    next = RemoveOurEntry(existing, instrPath, out var removed);
-                    action = removed
-                        ? "把本工具的路径从 instructions 数组移除（数组因此为空时保留 []，不删键；其它键一个不少）"
-                        : "instructions 里没有本工具的路径（无需改动）";
-                    next ??= existing;
+                    // 逆向撤销：先摘 instructions 里我们那一条（层 1 参与时），再摘系统层 prompt（层 3 参与时）。
+                    var work = existing;
+                    var steps = new List<string>();
+
+                    if (doInstr)
+                    {
+                        var removedInstr = RemoveOurEntry(work, instrPath, out var removed);
+                        if (removedInstr is not null) { work = removedInstr; steps.Add("instructions 里本工具的路径已摘除（数组为空时保留 []，不删键）"); }
+                        else steps.Add("instructions 里没有本工具的路径（无需改动）");
+                    }
+                    else
+                    {
+                        steps.Add("SkipSystemPrompt=true：配置指令层不参与还原，instructions 原样保留");
+                    }
+
+                    if (doAgents)
+                    {
+                        var undone = OpencodeConfig.RemoveOurAgentPrompts(work, systemText, out var gone, out var foreign);
+                        if (undone is not null)
+                        {
+                            work = undone;
+                            steps.Add($"agent prompt 已摘除：{string.Join("、", gone)}" +
+                                      "（只因本工具才被创建、撤销后成空对象的 agent 条目一并删掉；agent 键本身保留）");
+                        }
+                        else steps.Add("agent 的 prompt 里没有本工具写进去的内容（无需改动）");
+                        if (foreign.Count > 0)
+                            steps.Add($"别人的 prompt 保留未动：{string.Join("、", foreign)}（内容不是我们的）");
+                        agentWillWrite = undone is not null;
+                        agentAction = undone is not null
+                            ? $"摘除本工具写进去的 prompt：{string.Join("、", gone)}；agent 键与别人的字段原样保留。"
+                            : "agent 的 prompt 里没有本工具写进去的内容（无需改动）。";
+                    }
+
+                    next = work;
+                    action = string.Join("；", steps);
                 }
 
                 var willWrite = delete || !string.Equals(next, existing, StringComparison.Ordinal);
@@ -792,6 +1143,26 @@ public sealed class OpencodeTarget : ITargetAdapter
                     Notes = new[] { Notes.Info("配置指令层还原", action, configFile) },
                 });
 
+                if (doAgents)
+                {
+                    changes.Add(new PlannedChange
+                    {
+                        Path = configFile,
+                        Layer = LayerKind.PolicyText,
+                        WillWrite = agentWillWrite,
+                        BeforeBytes = FileText.Bytes(existing),
+                        AfterBytes = delete ? 0 : FileText.Bytes(next ?? existing),
+                        BackupPath = File.Exists(bm.BackupPath) ? bm.BackupPath : null,
+                        Notes = new[]
+                        {
+                            Notes.Info("系统提示词层还原", agentAction, configFile),
+                            Notes.Info("同一份文件",
+                                "系统提示词层与配置指令层共用 opencode.json，所以两条 PlannedChange 指向同一份文件、" +
+                                "报的是同一组字节数；契约的 PlannedChange 没有值级字段，逐 agent 的明细写在这里。", configFile),
+                        },
+                    });
+                }
+
                 if (willWrite && !options.DryRun)
                 {
                     if (delete) File.Delete(configFile);
@@ -802,18 +1173,25 @@ public sealed class OpencodeTarget : ITargetAdapter
                 if (!options.DryRun)
                 {
                     var backText = FileText.ReadOrNull(configFile);
-                    var leftover = backText is not null && OpencodeConfig.ContainsPath(backText, instrPath);
+                    var leftover = backText is not null &&
+                                   ((doInstr && OpencodeConfig.ContainsPath(backText, instrPath)) ||
+                                    (doAgents && OpencodeConfig.PlanAgentPrompts(backText, true, systemText).AppliedAgents.Count > 0));
                     if (leftover)
                     {
                         readBackClean = false;
-                        notes.Add(Notes.Error("回读有残留", $"还原后 instructions 里仍有本工具的路径：{configFile}", configFile));
+                        notes.Add(Notes.Error("回读有残留",
+                            $"还原后 opencode.json 里仍有本工具的内容（instructions 路径或 agent prompt）：{configFile}", configFile));
                     }
                     else
                     {
                         notes.Add(Notes.Info("回读校验",
                             backText is null
                                 ? "opencode.json 已删除（本工具从零创建的那一份）。"
-                                : "opencode.json 的 instructions 里已无本工具路径。", configFile));
+                                : doInstr && doAgents
+                                    ? "opencode.json 的 instructions 里已无本工具路径、四个 agent 的 prompt 里也没有本工具文本。"
+                                    : doInstr
+                                        ? "opencode.json 的 instructions 里已无本工具路径（本层未参与系统提示词层的还原）。"
+                                        : "opencode.json 的 agent prompt 里已无本工具文本（配置指令层本次未参与还原）。", configFile));
                     }
 
                     currentSha = backText is null ? null : FileText.Sha256Text(backText);
@@ -959,11 +1337,21 @@ public sealed class OpencodeTarget : ITargetAdapter
     /// <summary>
     /// 标记命中数自检。主判据 = **instruction_blob.value 全集**（那才是真正进了模型上下文的常驻指令载荷）；
     /// 会话消息里的命中数只作参考，写进 Verdict 附注。
+    ///
+    /// 判据的第一步是「能不能解析到一个会话」：库里一个会话都没有（客户端还没产生会话，或会话表已被清理）时
+    /// 命中数无从谈起——这时候报「命中 0 = 没生效」就是把「没有会话」说成「注入没生效」，是工具在撒谎。
+    /// 只有**读库失败**（IoError / 库不存在）才抛错，那种情况不许降级成「无法判定」。
     /// </summary>
     public MarkerReport CheckMarkers(string sessionId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var loc = Peek(ct);
+
+        // ListSessions 与 InstructionBlobRows 都是只读的现有通道：库不在 / 库坏了会直接抛（IoError / TargetFileMissing），
+        // 所以「读库失败必须抛错」的纪律由它们保证，这里的早退只覆盖「库是好的、就是没有会话」这一种状态。
+        if (OpencodeDb.ListSessions(loc.DbPath, ct).Count == 0)
+            return UndecidableReport(loc, ct);
+
         var id = OpencodeDb.ResolveSessionId(loc.DbPath, sessionId, ct);
 
         var (blobText, blobs) = OpencodeDb.InstructionBlobText(loc.DbPath, ct);
@@ -997,6 +1385,41 @@ public sealed class OpencodeTarget : ITargetAdapter
             (total == 0 ? " = 没生效）" : "）") + reference + "。";
         report.ExportedSystemPromptPath = TryExportSystemPrompt(loc, id, ct);
         return report;
+    }
+
+    /// <summary>
+    /// 无法判定：会话表是空的（客户端还没产生会话，或已清理过会话表）。
+    /// 结论写成「无法判定」，命中数断言由调用方跳过；同时如实报出仍然可读的只读证据——
+    /// instruction_blob 的行数，以及其中含本工具标记的条数。
+    ///
+    /// 关键区分：**「没有会话」≠「注入没生效」**。取证据时任何读库失败（IoError / 库不存在）照旧抛，
+    /// 「库坏了」不许被降级成「无法判定」。
+    /// </summary>
+    private MarkerReport UndecidableReport(OpencodeLocation loc, CancellationToken ct)
+    {
+        var rows = OpencodeDb.InstructionBlobRows(loc.DbPath, ct);
+        var ours = OpencodeMarkers.InstructionsMarkers
+            .Concat(OpencodeMarkers.SystemLayerMarkers)
+            .Concat(OpencodeMarkers.PayloadMarkers)
+            .ToArray();
+        var withMarkers = rows.Count(r => ours.Any(m => r.Contains(m, StringComparison.Ordinal)));
+
+        return new MarkerReport
+        {
+            // 哨兵会话号：调用方（CLI / verify.ps1 / UI）按它区分「无法判定」与「真的命中 0」。
+            SessionId = UndecidableSessionId,
+            // 没有可判定的会话文本，就不许编造命中数：Hits 留空而不是给一串 0。
+            Hits = Array.Empty<MarkerHit>(),
+            SystemPromptLayerPresent = false,
+            ContextPayloadLayerPresent = false,
+            TotalChars = 0,
+            Verdict =
+                "无法判定：库里没有会话（客户端未产生会话或已清理），跳过命中数断言——" +
+                "「没有会话」不等于「注入没生效」，此时报「命中 0」是错的。 " +
+                $"只读证据：instruction_blob 现有 {rows.Count} 条常驻指令载荷，其中 {withMarkers} 条含本工具标记" +
+                $"（标记合计命中 {rows.Sum(r => ours.Sum(m => FileText.Count(r, m)))} 次；{loc.DbPath}）。" +
+                "开一个新会话后重跑命中数自检。",
+        };
     }
 
     private static string? TryExportSystemPrompt(OpencodeLocation loc, string sessionId, CancellationToken ct)

@@ -568,11 +568,22 @@ public static class OpencodeDb
     /// </summary>
     public static (string Text, int Blobs) InstructionBlobText(string dbPath, CancellationToken ct)
     {
+        var rows = InstructionBlobRows(dbPath, ct);
+        return (string.Join("\n", rows), rows.Count);
+    }
+
+    /// <summary>
+    /// instruction_blob 逐行的 value（已 <see cref="Unwrap"/>，空行不计）。
+    /// 行粒度是必要的：判定解析不到会话时，能如实报出「instruction_blob 有几条、其中几条含本工具标记」——
+    /// 那是仍然可读的只读证据，拼成一大段之后只能数命中次数，报不出"几条载荷里含标记"。
+    /// 读不到 / 被占用照旧抛 <see cref="EngineErrorCode.IoError"/>，绝不静默返回空。
+    /// </summary>
+    public static IReadOnlyList<string> InstructionBlobRows(string dbPath, CancellationToken ct)
+    {
         return With(dbPath, cn =>
         {
-            if (!TableExists(cn, "instruction_blob")) return ("", 0);
-            var sb = new StringBuilder();
-            var n = 0;
+            var rows = new List<string>();
+            if (!TableExists(cn, "instruction_blob")) return (IReadOnlyList<string>)rows;
             using var cmd = cn.CreateCommand();
             cmd.CommandText = "SELECT value FROM instruction_blob ORDER BY hash";
             using var rd = cmd.ExecuteReader();
@@ -581,12 +592,10 @@ public static class OpencodeDb
                 ct.ThrowIfCancellationRequested();
                 var v = Str(rd, 0);
                 if (string.IsNullOrEmpty(v)) continue;
-                n++;
-                if (sb.Length > 0) sb.Append('\n');
-                sb.Append(Unwrap(v));
+                rows.Add(Unwrap(v));
             }
-            return (sb.ToString(), n);
-        }, "InstructionBlobText");
+            return rows;
+        }, "InstructionBlobRows");
     }
 
     /// <summary>

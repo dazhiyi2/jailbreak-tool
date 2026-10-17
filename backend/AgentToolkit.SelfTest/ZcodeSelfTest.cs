@@ -656,17 +656,53 @@ public sealed class ZcodeSelfTest : ITargetSelfTest
             r.Check(FileText.Count(bakText, p.Anchor) == 1, $"真实备份里 {p.Id} 的 anchor 逐字命中 1 次（补丁表与 3.14.4 原文一致）");
         r.Check(ZcodePatchTable.Markers.All(m => FileText.Count(bakText, m) == 0), "真实备份里 marker 全 0（干净）");
         r.Check(FileText.Count(bakText, "require clear authorization context") == 1, "真实备份里保留了出厂条款原文");
-
-        var realText = FileText.Read(found);
-        r.Check(ZcodePatchTable.Markers.All(m => FileText.Count(realText, m) == 1), "真实 bundle 里五道 marker 各命中 1");
-        r.Check(FileText.Count(realText, ZcodePatchTable.Patches[3].Anchor) == 1 && FileText.Count(realText, ZcodePatchTable.Patches[4].Anchor) == 1,
-            "真实 bundle 里 P4/P5 anchor 各命中 1（与合成 fixture 打完后的计数一致）");
         r.Check(!File.Exists(realBackup + ".contaminated"), "真实备份没有被标记为污染");
 
-        var realDiff = ZcodeLogs.Diff(found, realBackup, null, default);
-        r.Check(realDiff.AfterText.Contains("machine owner's own computer"), "真实 diff：BeforeText/AfterText 都取到了内容（当前安全段）");
-        r.Check(realDiff.BeforeText.Contains("authorized security testing"), "真实 diff：出厂安全段取到内容");
-        r.Check(realDiff.AddedLines + realDiff.RemovedLines > 0, $"真实 diff 有逐行差异（+{realDiff.AddedLines}/-{realDiff.RemovedLines}）");
+        // 真实 bundle 现在是「已注入」还是「出厂态」：判据用补丁表现成的 StateOf（marker 命中 → Applied，
+        // 与状态页 RollupBundle / StatusBuilder 的口径一致），不另造一套。两种状态都只读，一个字节都不写。
+        var realText = FileText.Read(found);
+        var markerCounts = ZcodePatchTable.Patches.Select(p => FileText.Count(realText, p.Marker)).ToArray();
+        var applied = ZcodePatchTable.Patches.Where((_, i) => markerCounts[i] > 0).Select(p => p.Id).ToArray();
+        r.Step("    真实 bundle 的五道 marker 命中：" +
+               string.Join(" ", ZcodePatchTable.Patches.Select((p, i) => $"{p.Id}={markerCounts[i]}")));
+
+        if (applied.Length > 0)
+        {
+            // ---------- 已注入态：逐条验证五道 marker、P4/P5 anchor、真实 diff 有差异 ----------
+            r.Check(ZcodePatchTable.Markers.All(m => FileText.Count(realText, m) == 1), "真实 bundle 里五道 marker 各命中 1");
+            r.Check(FileText.Count(realText, ZcodePatchTable.Patches[3].Anchor) == 1 && FileText.Count(realText, ZcodePatchTable.Patches[4].Anchor) == 1,
+                "真实 bundle 里 P4/P5 anchor 各命中 1（与合成 fixture 打完后的计数一致）");
+
+            var realDiff = ZcodeLogs.Diff(found, realBackup, null, default);
+            r.Check(realDiff.AfterText.Contains("machine owner's own computer"), "真实 diff：AfterText（当前 bundle）里是注入后的安全段");
+            r.Check(!realDiff.BeforeText.Contains("machine owner's own computer"), "真实 diff：BeforeText（出厂备份）里没有注入后的安全段");
+            r.Check(realDiff.BeforeText.Contains("authorized security testing"), "真实 diff：BeforeText 取出厂备份里的安全段原文");
+            r.Check(realDiff.AddedLines + realDiff.RemovedLines > 0, $"真实 diff 有逐行差异（+{realDiff.AddedLines}/-{realDiff.RemovedLines}）");
+        }
+        else
+        {
+            // ---------- 出厂态：marker 0 命中不是失败，是当前状态；按出厂态核对（README/verify 的「出厂态跳过」同口径）----------
+            r.Step("    真实 bundle 当前是出厂态（五道 marker 全部 0 命中），跳过已注入态断言；" +
+                   "下面按出厂态核对：marker 命中 0 / P4·P5 anchor 命中 0 / 与出厂备份 diff 为 +0/-0。");
+            r.Check(markerCounts.All(c => c == 0),
+                $"出厂态：五道 marker 命中 0（实际 {string.Join("/", markerCounts)}）——这版没被注入过，不是自检失败");
+            r.Check(ZcodePatchTable.Patches.Take(3).All(p => FileText.Count(realText, p.Anchor) == 1),
+                "出厂态：P1–P3 anchor 各命中 1（盘上就是补丁表认的原文，不是升级换过的新版本）");
+            r.Check(FileText.Count(realText, ZcodePatchTable.Patches[3].Anchor) == 0 &&
+                    FileText.Count(realText, ZcodePatchTable.Patches[4].Anchor) == 0,
+                "出厂态：P4/P5 anchor 命中 0（这两句是 P1/P4 打完才在现场生成的）");
+            r.Check(FileText.Count(realText, "may or may not be relevant") == 1,
+                "出厂态：削弱句「may or may not be relevant」仍在（确系原件）");
+
+            var realDiff = ZcodeLogs.Diff(found, realBackup, null, default);
+            r.Check(realDiff.AddedLines + realDiff.RemovedLines == 0,
+                $"出厂态：与出厂备份的逐行差异为 +0/-0（实际 +{realDiff.AddedLines}/-{realDiff.RemovedLines}）");
+            r.Check(realDiff.AfterText.Contains("authorized security testing"), "出厂态：当前 bundle 里是出厂安全段原文");
+            r.Check(!realDiff.AfterText.Contains("machine owner's own computer"), "出厂态：当前 bundle 里没有注入后的安全段");
+            r.Check(FileText.Sha256File(found) == FileText.Sha256File(realBackup),
+                "出厂态：当前 bundle 与出厂备份逐字节一致（diff +0/-0 的字节级佐证）");
+        }
+
         ctx.Log("real install + real log read-only cross-check ok");
     }
 

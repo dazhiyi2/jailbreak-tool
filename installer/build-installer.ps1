@@ -8,7 +8,7 @@
 
 [CmdletBinding()]
 param(
-  [string]$Version = '1.0.1',
+  [string]$Version = '1.0.2',
   [string]$Stage = "$env:TEMP\agent-toolkit-stage",
   [string]$OutDir = '',
   [switch]$SkipPublish,

@@ -21,6 +21,7 @@
 | **ZCode** 3.14.x | 明文提示词的本地应用 | `resources\glm\zcode.cjs` 五道字符串补丁 | `~/.zcode/AGENTS.md`（上限 100 KB） | `~/.zcode/cli/rollout/model-io-sess_*.jsonl`（明文） |
 | **opencode** 2.0.x | 打包 Electron + Bun 单文件 CLI | **客户端里没有可删的安全条款**（同 DSH 型）→ 走官方配置通道：系统层 `agent.<名字>.prompt`（**关键层**）+ 配置指令层 `opencode.json` 的 `instructions` | `~/.config/opencode/AGENTS.md`（全局，**会被降级成"本机偏好"**） | `~/.local/share/opencode/opencode.db`（SQLite；推理在 `session_message.data.content[].text`，生效证据在 `instruction_blob`） |
 | **Google Antigravity**（Gemini）2.24.x | VS Code 分支 + 原生语言服务器（163.5 MB Go 二进制） | **本地评审员提示词明文在二进制里**，走等长字节补丁（工具在 `tools\patch-antigravity.ps1`，不在引擎里） | `~/.gemini/config/rules/AGENTS.md`（单文件上限 24 KB） | `~/.gemini/antigravity/conversations/*.db`（SQLite；推理在 `steps.step_payload` 的 protobuf，`step_type=15` 的 `.20.3`） |
+| **Cursor** 3.25.x | VS Code 分支 + Electron（**无 asar，`out\` 是目录**） | `system_prompt` 服务端下发（本地无明文）→ 打的是**规则框架句**：4 个 JS 文件里 `user_rules` 的定性句 `…follow if appropriate`（**"如果合适的话"= 给了裁量权**），等长替换 | 个人规则 `state.vscdb` → `ItemTable` 键 `aicontext.personalContext`；项目规则 `<workspace>\.cursor\rules\*.mdc`（`alwaysApply: true` 才进正文） | `%APPDATA%\Cursor\User\globalStorage\state.vscdb`（SQLite；`cursorDiskKV` 的 `composerData:<id>` / `bubbleId:*`；**生效证据是 `promptTokenBreakdown` 里 `rules` 档的 `characterCount`**） |
 
 > opencode 的阶段 0 侦察与适配器均已完成（见 [docs/opencode.md](docs/opencode.md)）：提示词在 203.8 MB 的 Bun 单文件里但**没有安全条款**，所以不做补丁层；注入走官方配置通道。**三个通道的权力排序是实测出来的**：系统层 `agent.<名字>.prompt` 被当硬性规定执行；`instructions` 与 `AGENTS.md` 会被归类成"文件"，后者甚至被模型点名驳回为"本机偏好"。而且**系统层里也不能自我声明权威**——"与系统提示词同级"这类自证加上强制校验标记，会被直接指认成注入。
 > 它在三个目标里验证条件最好：`instruction_blob` 记录的是**真正进了模型上下文的常驻指令载荷**，所以"命中数自检"直接查"模型被告知了什么"，而不是靠聊天记录里数标记。**真实端到端已跑通**（apply → 开新会话 → blob 从 4 条涨到 6 条、命中 7 次 → revert 逐字节回厂）。
@@ -33,15 +34,15 @@
 toolkit/
 ├── AgentToolkit.slnx
 ├── backend/
-│   ├── AgentToolkit.Core/          核心库：支持层 + 两个目标适配器 + MultiTargetEngine
+│   ├── AgentToolkit.Core/          核心库：支持层 + 五个目标适配器 + MultiTargetEngine
 │   │   ├── Support/                Text 文件与备份 / Probe 多级定位 / Store 注入文本与台账 /
 │   │   │                           Logs 多帧 zstd 与 jsonl / Status 层状态装配
-│   │   └── Targets/                ITargetAdapter.cs · Dsh/ · Zcode/
+│   │   └── Targets/                ITargetAdapter.cs · Dsh/ · Zcode/ · Opencode/ · Antigravity/ · Cursor/
 │   ├── AgentToolkit.Engine.Cli/    命令行入口 → 单文件 engine.exe（自包含，无需 Node/PowerShell/.NET 运行时）
 │   ├── AgentToolkit.SelfTest/      回归自检：全部用例在沙箱副本上跑，不碰真实客户端
 │   └── dist/engine.exe
 ├── ui/                             WinUI 3 界面（未打包自包含）
-└── docs/                           两个目标的档案：资产地图、锚点、实测证据
+└── docs/                           五个目标的档案：资产地图、锚点、实测证据
 ```
 
 界面与引擎之间只有一个接缝：`ui\Services\ServiceLocator.cs` 里的一行，它返回 `MultiTargetEngine`。
@@ -61,6 +62,9 @@ $dn = 'C:\Program Files\dotnet\dotnet.exe'
 # 回归自检（沙箱，不碰真实客户端）
 & $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target dsh
 & $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target zcode
+& $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target opencode
+& $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target antigravity
+& $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target cursor
 ```
 
 ## 命令行用法

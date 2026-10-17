@@ -121,10 +121,12 @@ else {
     $hasZcode = $names -match 'ZCode'
     $hasOc = $names -match 'opencode'
     $hasAg = $names -match 'Antigravity'
+    $hasCur = $names -match 'Cursor'
     if ($hasDsh) { Ok "列出 DeepSeek Harness" } else { Bad "下拉里没有 DeepSeek Harness" }
     if ($hasZcode) { Ok "列出 ZCode" } else { Bad "下拉里没有 ZCode" }
     if ($hasOc) { Ok "列出 opencode" } else { Bad "下拉里没有 opencode" }
     if ($hasAg) { Ok "列出 Google Antigravity" } else { Bad "下拉里没有 Google Antigravity" }
+    if ($hasCur) { Ok "列出 Cursor" } else { Bad "下拉里没有 Cursor" }
     $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
   } catch { Bad "展开目标选择器失败：$($_.Exception.Message)" }
 }

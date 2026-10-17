@@ -2,6 +2,7 @@ using AgentToolkit.Contracts;
 using AgentToolkit.Core.Support;
 using AgentToolkit.Core.Targets;
 using AgentToolkit.Core.Targets.Antigravity;
+using AgentToolkit.Core.Targets.Cursor;
 using AgentToolkit.Core.Targets.Dsh;
 using AgentToolkit.Core.Targets.Opencode;
 using AgentToolkit.Core.Targets.Zcode;
@@ -26,6 +27,7 @@ public sealed class MultiTargetEngine : IAgentEngine
         Register(new ZcodeTarget(BuildContext("zcode", root)));
         Register(new OpencodeTarget(BuildContext("opencode", root)));
         Register(new AntigravityTarget(BuildContext("antigravity", root)));
+        Register(new CursorTarget(BuildContext("cursor", root)));
 
         _currentId = _adapters.ContainsKey("dsh") ? "dsh" : _adapters.Keys.First();
     }
@@ -42,6 +44,7 @@ public sealed class MultiTargetEngine : IAgentEngine
             "dsh" => DshTarget.PolicyDefs,
             "zcode" => ZcodeTarget.PolicyDefs,
             "opencode" => OpencodeTarget.PolicyDefs,
+            "cursor" => CursorTarget.PolicyDefs,
             _ => AntigravityTarget.PolicyDefs,
         };
         var policy = new PolicyStore(dataDir);
@@ -121,6 +124,7 @@ public sealed class MultiTargetEngine : IAgentEngine
         "zcode" => "ZCode",
         "opencode" => "opencode-cli",
         "antigravity" => "Antigravity",
+        "cursor" => "Cursor",
         _ => null,
     };
 

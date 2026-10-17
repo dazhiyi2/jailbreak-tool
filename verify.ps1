@@ -50,7 +50,7 @@ function Invoke-Step([string]$name, [scriptblock]$body) {
 if (-not (Test-Path -LiteralPath $Dotnet)) { Write-Host "找不到 dotnet：$Dotnet" -ForegroundColor Red; exit 2 }
 if (-not (Test-Path -LiteralPath $Sln))    { Write-Host "找不到解决方案：$Sln" -ForegroundColor Red; exit 2 }
 
-$targets = if ($Target) { @($Target) } else { @("dsh", "zcode", "opencode", "antigravity") }
+$targets = if ($Target) { @($Target) } else { @("dsh", "zcode", "opencode", "antigravity", "cursor") }
 
 # ---------------------------------------------------------------- 1. 构建
 if (-not $SkipBuild) {

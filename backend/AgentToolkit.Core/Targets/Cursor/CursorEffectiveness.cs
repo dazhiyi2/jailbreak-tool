@@ -70,12 +70,20 @@ public static class CursorEffectiveness
         CursorBaseline? baseline,
         int personalChars,
         int payloadBodyChars,
-        int payloadFileChars)
+        int payloadFileChars,
+        bool payloadWritten = true)
     {
         var withBreakdown = sessions.Count(s => s.HasBreakdown);
         var newest = CursorDb.NewestWithBreakdown(sessions);
-        var expectedMin = personalChars + payloadBodyChars;
-        var expectedMax = personalChars + payloadFileChars;
+        // 预期区间必须只算**实际会写进去的层**。层 3（项目规则）在工作区解析不到时是
+        // TargetAbsent、根本不会写盘，此时把它的正文算进预期会报出"幅度不符"的假警报。
+        // 层 3 未写时只剩层 2，另留一段段落包装开销的容许上限（实测 <user_rule> 标签对约 24 字符）。
+        const int WrapperAllowance = 64;
+        var expectedMin = payloadWritten ? personalChars + payloadBodyChars : personalChars;
+        var expectedMax = payloadWritten ? personalChars + payloadFileChars : personalChars + WrapperAllowance;
+        var expectText = payloadWritten
+            ? $"（层 2 个人规则 {personalChars} + 层 3 项目规则正文 {payloadBodyChars}~整份文件 {payloadFileChars}）"
+            : $"（层 3 项目规则未写入——工作区解析不到，预期只有层 2 个人规则 {personalChars} 加段落包装开销，容许 ≤{WrapperAllowance}）";
 
         EffectivenessReading Make(EffectivenessState state, string verdict, int? rules, int? sys, int? delta) => new()
         {
@@ -128,13 +136,12 @@ public static class CursorEffectiveness
         if (delta.Value >= expectedMin && delta.Value <= expectedMax)
             return Make(EffectivenessState.Effective,
                 $"已生效（定量）：最近会话（{newest.Id}）的 rules 档 {b} → {rules} 字符，增长 {delta.Value}，" +
-                $"落在预期增长区间 [{expectedMin}, {expectedMax}]（层 2 个人规则 {personalChars} + 层 3 项目规则正文 {payloadBodyChars}" +
-                $"~整份文件 {payloadFileChars}）。",
+                $"落在预期增长区间 [{expectedMin}, {expectedMax}]" + expectText + "。",
                 rules, newest.SystemPromptChars, delta);
 
         return Make(EffectivenessState.Partial,
             $"有增长但幅度与预期不符：最近会话（{newest.Id}）的 rules 档 {b} → {rules} 字符，增长 {delta.Value}，" +
-            $"预期区间 [{expectedMin}, {expectedMax}]（层 2 {personalChars} + 层 3 正文 {payloadBodyChars}~整份 {payloadFileChars}）。" +
+            $"预期区间 [{expectedMin}, {expectedMax}]" + expectText + "。" +
             "如实报数字，不硬判：先核对层 2 的值是否真的在库里、层 3 的 alwaysApply 是否为 true。",
             rules, newest.SystemPromptChars, delta);
     }

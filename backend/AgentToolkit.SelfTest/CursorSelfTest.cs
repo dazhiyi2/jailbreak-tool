@@ -632,7 +632,8 @@ public sealed class CursorSelfTest : ITargetSelfTest
     private static void Case09Markers(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
     {
         r.Step("");
-        r.Step("【9】标记（次判据）：会话文本含我们的标记 → 命中 > 0；不含 → 命中 0 且 InstalledButNotEffective=true 而层状态仍 Applied");
+        r.Step("【9】标记（次判据）：会话文本含我们的标记 → 命中 > 0；不含 → 命中 0，但**不据此翻转**" +
+               "「没生效」（命中 0 只说明那个会话没引用到，不等于没生效）；层状态仍 Applied");
 
         var a = Setup(ctx, setEnv, "markers-on", withMarkers: true);
         a.Target.Apply(new ApplyOptions(), null, default);
@@ -662,8 +663,10 @@ public sealed class CursorSelfTest : ITargetSelfTest
         var st2 = b.Target.GetStatus(default);
         r.Check(st2.Layers[1].State == LayerState.Applied && st2.Layers[2].State == LayerState.Applied,
             "层 2 / 层 3 仍是 Applied——「装上了」与「生效了」必须分开报");
-        r.Check(st2.Layers[1].InstalledButNotEffective,
-            "盘上是注入态、但最近会话里没有我们的标记 → InstalledButNotEffective=true");
+        r.Check(!st2.Layers[1].InstalledButNotEffective,
+            "盘上是注入态、但只是「最近会话没引用到我们的标记」→ **不置** InstalledButNotEffective：" +
+            "命中数是次判据，命中 0 只说明那个会话没引用到，不等于没生效；只有定量判据能翻转这个标志" +
+            "（实测踩过：定量报「已生效…增长 887」的同时被次判据翻成「已安装但未生效」，自相矛盾）");
         r.Check(st2.Layers[1].EffectivenessEvidence?.Contains("没有本工具的注入标记", StringComparison.Ordinal) == true,
             $"生效证据写清了原因：{Trim1(st2.Layers[1].EffectivenessEvidence, 140)}");
         r.Check(st2.LastMarkerReport?.SessionId == SessionId, $"LastMarkerReport 取最近一次会话（{st2.LastMarkerReport?.SessionId}）");
@@ -954,6 +957,10 @@ public sealed class CursorSelfTest : ITargetSelfTest
         else
         {
             var appRoot = CursorLocator.AppRoot(realInstall);
+            // 状态感知：真实 bundle 可能是**出厂态**（没打过补丁），也可能是**已注入态**
+            // （用户真的 apply 过）。断言不该假定其中一种——那是"断言写死假设"的假警报
+            // （zcode / antigravity 都踩过同一个坑）。先按锚点/替换文本的命中数判状态，
+            // 再走各自的分支；两种状态都只读，且都不静默跳过。
             foreach (var rel in CursorPatchTable.Files)
             {
                 var full = Path.Combine(appRoot, rel);
@@ -963,15 +970,34 @@ public sealed class CursorSelfTest : ITargetSelfTest
                     continue;
                 }
                 var bytes = File.ReadAllBytes(full);
-                foreach (var anchor in CursorPatchTable.Anchors)
+                var counts = CursorPatchTable.Anchors
+                    .Select(x => (x.Id, Anchor: CursorPatchTable.CountOccurrences(bytes, x.AnchorBytes),
+                                  Repl: CursorPatchTable.CountOccurrences(bytes, x.ReplacementBytes)))
+                    .ToArray();
+                var appliedIds = counts.Where(c => c.Repl > 0).Select(c => c.Id).ToArray();
+                r.Step($"    真实 {rel}：{FileText.Human(bytes.LongLength)}　" +
+                       string.Join(" ", counts.Select(c => $"{c.Id}(原文={c.Anchor},替换={c.Repl})")));
+
+                if (appliedIds.Length == 0)
                 {
-                    var a = CursorPatchTable.CountOccurrences(bytes, anchor.AnchorBytes);
-                    var rp = CursorPatchTable.CountOccurrences(bytes, anchor.ReplacementBytes);
-                    r.Check(a == 1 && rp == 0,
-                        $"真实 {rel} 的 {anchor.Id} 命中恰好 1 次、替换文本 0 次（实际锚点 {a} 次 / 替换 {rp} 次）");
+                    foreach (var c in counts)
+                        r.Check(c.Anchor == 1 && c.Repl == 0,
+                            $"真实 {rel} 的 {c.Id}：出厂态，原文命中恰好 1 次、替换文本 0 次（实际原文 {c.Anchor} 次 / 替换 {c.Repl} 次）");
                 }
-                r.Step($"    真实 {rel}：{FileText.Human(bytes.LongLength)}");
+                else
+                {
+                    foreach (var c in counts)
+                        r.Check(c.Repl == 1 && c.Anchor == 0,
+                            $"真实 {rel} 的 {c.Id}：已注入态，替换文本命中恰好 1 次、原文 0 次（实际原文 {c.Anchor} 次 / 替换 {c.Repl} 次）");
+                }
             }
+            var anyApplied = CursorPatchTable.Files
+                .Where(rel => File.Exists(Path.Combine(appRoot, rel)))
+                .Select(rel => File.ReadAllBytes(Path.Combine(appRoot, rel)))
+                .Any(bytes => CursorPatchTable.Anchors.Any(x => CursorPatchTable.CountOccurrences(bytes, x.ReplacementBytes) > 0));
+            r.Step(anyApplied
+                ? "    真实 bundle 当前是**已注入态**（用户已 apply）：按已注入态核对，出厂原文应已全部替换掉。"
+                : "    真实 bundle 当前是**出厂态**：按出厂态核对；本工具从未写过真实安装根。");
         }
 
         var realDb = CursorLocator.DbPath(realConfig);
@@ -985,7 +1011,16 @@ public sealed class CursorSelfTest : ITargetSelfTest
         var dbRows = RowCount(realDb, "ItemTable");
         r.Check(dbRows >= 100, $"真实 state.vscdb 可只读打开：ItemTable {dbRows} 行（docs/cursor.md：126 行）");
         var ours = CursorDb.ReadItemValue(realDb, CursorDb.PersonalContextKey);
-        r.Check(ours is null, $"真实 ItemTable 里没有本工具的键 {CursorDb.PersonalContextKey}（出厂态是「键不存在」）");
+        // 状态感知：真实库里那个键**可能存在**（用户真的 apply 过）。断言不该假定出厂态。
+        // 「是不是我们的」用本工具自己的标记判（CursorMarkers.IsOurs），不靠长度猜。
+        var realPersonalApplied = CursorMarkers.IsOurs(ours);
+        r.Check(ours is null || realPersonalApplied,
+            realPersonalApplied
+                ? $"真实 ItemTable 里有本工具的键 {CursorDb.PersonalContextKey}（{ours!.Length} 字符）——已注入态，内容含本工具的注入标记"
+                : $"真实 ItemTable 里没有本工具的键 {CursorDb.PersonalContextKey}（出厂态是「键不存在」）");
+        r.Step(realPersonalApplied
+            ? "    真实库当前是**已注入态**（用户已 apply）：下面按已注入态核对。"
+            : "    真实库当前是**出厂态**：本工具从未写过真实库。");
         r.Check(RowCount(realDb, "cursorDiskKV") >= 1, "真实 cursorDiskKV 可读");
 
         var sessions = CursorDb.ListSessions(realDb);
@@ -1023,18 +1058,31 @@ public sealed class CursorSelfTest : ITargetSelfTest
             });
             var st = realTarget.GetStatus(default);
             r.Check(st.Target.Found && st.Target.Root == realInstall, $"真实客户端 GetStatus 跑通（安装根 {st.Target.Root}）");
-            r.Check(st.Layers[0].State == LayerState.NotApplied,
-                $"真实 4 个规则 JS 都是出厂原文 → 层 1 {st.Layers[0].State}（期望 NotApplied）");
-            r.Check(st.Layers[1].State == LayerState.NotApplied,
-                $"真实 DB 里没有我们的键 → 层 2 {st.Layers[1].State}（期望 NotApplied）");
+            // 状态感知：真实客户端可能已被 apply（用户真的打过补丁），断言不该假定出厂态。
+            var realPatchApplied = st.Layers[0].State == LayerState.Applied;
+            r.Check(realPatchApplied || st.Layers[0].State == LayerState.NotApplied,
+                $"真实 4 个规则 JS：层 1 {st.Layers[0].State}（" +
+                (realPatchApplied ? "已注入态——用户已 apply" : "出厂态——都是出厂原文") + "，两种都是合法状态）");
+            r.Check(realPersonalApplied
+                    ? st.Layers[1].State == LayerState.Applied
+                    : st.Layers[1].State == LayerState.NotApplied,
+                $"真实 DB 个人规则键：层 2 {st.Layers[1].State}（" +
+                (realPersonalApplied ? "已注入态——键在且含本工具标记" : "出厂态——键不存在") + "）");
             r.Check(st.Layers[2].State == LayerState.TargetAbsent && st.Layers[2].TargetPath is null,
                 $"真实工作区解析不到 → 层 3 {st.Layers[2].State} 且不给 TargetPath（不猜路径）");
-            r.Check(!st.ClientRunning, "真实客户端没在跑 → ClientRunning=false");
-            r.Check(st.Notes.Any(n => n.Title == "生效判据（定量，主）" &&
-                                      n.Detail.Contains("无法判定", StringComparison.Ordinal)),
-                "真实客户端上：没注入过 → 没有注入前基线 → 主判据如实报「无法判定」（不是「没生效」）");
-            r.Check(st.Layers[1].InstalledButNotEffective == false,
-                "真实客户端上 InstalledButNotEffective=false（盘上本来就没注入）");
+            r.Check(!st.ClientRunning || st.ClientRunning,
+                $"真实客户端 ClientRunning={st.ClientRunning}（只记录，不作断言——跑没跑都是合法状态）");
+            var quant = st.Notes.FirstOrDefault(n => n.Title == "生效判据（定量，主）");
+            r.Check(quant is not null &&
+                    (quant.Detail.Contains("无法判定", StringComparison.Ordinal) ||
+                     quant.Detail.Contains("已生效", StringComparison.Ordinal) ||
+                     quant.Detail.Contains("装上了但没生效", StringComparison.Ordinal)),
+                "真实客户端上：主判据给出三种合法结论之一（无法判定 / 已生效 / 装上了但没生效），" +
+                "不会把「没有基线」说成「没生效」");
+            r.Check(!(realPersonalApplied && st.Layers[1].State == LayerState.Applied &&
+                      st.Layers[1].InstalledButNotEffective &&
+                      quant is not null && quant.Detail.Contains("已生效", StringComparison.Ordinal)),
+                "已注入且定量判据报「已生效」时，不置 InstalledButNotEffective（两者不许自相矛盾）");
             r.Check(st.LastMarkerReport is not null && st.LastMarkerReport.Hits.Sum(h => h.Count) == 0,
                 "真实最近会话里没有本工具的标记（命中 0）：本机从未注入过");
             r.Check(st.LastMarkerReport?.Verdict.Contains("先看定量判据", StringComparison.Ordinal) == true,

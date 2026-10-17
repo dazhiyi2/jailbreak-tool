@@ -173,7 +173,8 @@ public sealed class CursorTarget : ITargetAdapter
             baseline,
             personal.Length,
             CursorRules.ExtractBody(rendered).Length,
-            payloadFile is { Length: > 0 } ? payloadFile.Length : rendered.Length);
+            payloadFile is { Length: > 0 } ? payloadFile.Length : rendered.Length,
+            payloadWritten: payloadFile is { Length: > 0 });
 
         ApplyEffectiveness(dbLayer, "个人规则层", reading, null, null);
         ApplyEffectiveness(rulesLayer, "项目规则层", reading, null, null);
@@ -492,7 +493,10 @@ public sealed class CursorTarget : ITargetAdapter
         var installed = layer.State == LayerState.Applied;
         var quantNotEffective = reading.State == EffectivenessState.InstalledButNotEffective;
         var markerMiss = sessionId is not null && markerHits == 0;
-        layer.InstalledButNotEffective = installed && (quantNotEffective || markerMiss);
+        // 只有**定量判据**能翻转「没生效」。命中数（次判据）不能：命中 0 只说明那个会话没引用到
+        // 我们的文本（会话可能早于注入），把它当成"没生效"会与定量结论自相矛盾
+        // ——实测出现过「已生效（定量）…增长 887」与「已安装但未生效」并排的荒唐输出。
+        layer.InstalledButNotEffective = installed && quantNotEffective;
 
         var sb = new StringBuilder();
         sb.Append('「').Append(what).Append('」').Append(reading.Verdict);

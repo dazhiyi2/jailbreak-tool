@@ -1,0 +1,28 @@
+<Page x:Class="AgentToolkit.Ui.Views.RevertPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:controls="using:AgentToolkit.Ui.Controls">
+    <ScrollViewer><StackPanel Padding="28,20,28,28" Spacing="16">
+        <Grid><StackPanel Spacing="4"><TextBlock Text="还原" Style="{ThemeResource TitleTextBlockStyle}" /><TextBlock Text="先试运行预览，再执行还原并检查回读与原始哈希。" Style="{StaticResource MutedTextStyle}" /></StackPanel><Button Content="试运行预览" Command="{Binding RefreshCommand}" HorizontalAlignment="Right" /></Grid>
+        <controls:PageFeedback />
+        <Border Style="{StaticResource CardStyle}"><ContentControl IsEnabled="{Binding IsInteractive}" HorizontalContentAlignment="Stretch"><StackPanel Spacing="12">
+            <ToggleSwitch Header="还原后移除备份" OnContent="已请求" OffContent="保留备份" IsOn="{Binding RemoveBackupsRequested, Mode=TwoWay}" />
+            <TextBlock Text="{Binding BackupOptionLabel}" Style="{StaticResource MutedTextStyle}" />
+            <InfoBar IsOpen="{Binding BackupConfirmationOpen}" IsClosable="False" Severity="Warning" Title="再次确认移除备份" Message="确认后将把 RemoveBackups=true 交给引擎。请确认不再需要保留这些备份，然后重新预览还原范围。">
+                <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,8,0,0"><Button Content="确认还原后移除备份" Command="{Binding ConfirmRemoveBackupsCommand}" /><Button Content="保留备份" Command="{Binding CancelRemoveBackupsCommand}" /></StackPanel>
+            </InfoBar>
+        </StackPanel></ContentControl></Border>
+        <StackPanel Spacing="16" Visibility="{Binding ContentVisibility}">
+            <ListView ItemsSource="{Binding Changes}" ItemTemplate="{StaticResource ChangeTemplate}" SelectionMode="None" />
+            <Border Style="{StaticResource CardStyle}"><StackPanel Spacing="12">
+                <TextBlock Text="还原结果与自证" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                <TextBlock Text="回读残留检查" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding ReadBack}" TextWrapping="Wrap" />
+                <TextBlock Text="与首次备份一致" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding MatchesOriginal}" TextWrapping="Wrap" />
+                <TextBlock Text="原始哈希（SHA-256）" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding OriginalHash}" Style="{StaticResource MonoTextStyle}" />
+                <TextBlock Text="当前哈希（SHA-256）" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding CurrentHash}" Style="{StaticResource MonoTextStyle}" />
+            </StackPanel></Border>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="12"><Button Content="执行还原" Command="{Binding RevertCommand}" Style="{StaticResource AccentButtonStyle}" /><Button Content="取消执行" Command="{Binding CancelCommand}" IsEnabled="{Binding IsLoading}" /></StackPanel>
+        <TextBlock Text="更改备份选项后需重新试运行，执行按钮才会启用。" Style="{StaticResource MutedTextStyle}" />
+    </StackPanel></ScrollViewer>
+</Page>

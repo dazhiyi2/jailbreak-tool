@@ -1,0 +1,67 @@
+<Page x:Class="AgentToolkit.Ui.Views.StatusPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:controls="using:AgentToolkit.Ui.Controls">
+    <ScrollViewer>
+        <StackPanel Padding="28,20,28,28" Spacing="16">
+            <Grid>
+                <StackPanel Spacing="4"><TextBlock Text="状态" Style="{ThemeResource TitleTextBlockStyle}" /><TextBlock Text="分别核对安装状态、备份健康度与会话中的生效证据。" Style="{StaticResource MutedTextStyle}" /></StackPanel>
+                <Button Content="刷新状态" Command="{Binding RefreshCommand}" HorizontalAlignment="Right" VerticalAlignment="Center" />
+            </Grid>
+            <controls:PageFeedback />
+            <StackPanel Spacing="16" Visibility="{Binding ContentVisibility}">
+                <Border Style="{StaticResource CardStyle}">
+                    <Grid ColumnSpacing="28" RowSpacing="8">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                        <TextBlock Text="{Binding Version}" FontWeight="SemiBold" />
+                        <TextBlock Grid.Column="1" Text="{Binding Processes}" />
+                        <StackPanel Grid.Row="1" Spacing="2"><TextBlock Text="安装根路径" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding Root}" Style="{StaticResource MonoTextStyle}" /></StackPanel>
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="2"><TextBlock Text="配置根路径" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding ConfigHome}" Style="{StaticResource MonoTextStyle}" /></StackPanel>
+                        <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding CheckedAt}" Style="{StaticResource MutedTextStyle}" />
+                    </Grid>
+                </Border>
+                <InfoBar IsOpen="{Binding RestartRequired}" IsClosable="False" Severity="Warning" Title="改动需重启" Message="请完全退出客户端及托盘进程，再启动客户端以验证新会话。" />
+                <ItemsControl ItemsSource="{Binding Layers}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Style="{StaticResource CardStyle}" Margin="0,0,0,12">
+                                <StackPanel Spacing="10">
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Name}" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                                        <controls:StatusBadge Grid.Column="1" Text="{Binding StateLabel}" Tone="{Binding StateTone}" />
+                                        <controls:StatusBadge Grid.Column="2" Text="{Binding ParseLabel}" Tone="{Binding ParseTone}" />
+                                        <controls:StatusBadge Grid.Column="3" Text="{Binding BackupLabel}" Tone="{Binding BackupTone}" />
+                                    </Grid>
+                                    <Grid ColumnSpacing="12"><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions><TextBlock Text="{Binding Path}" Style="{StaticResource MonoTextStyle}" /><TextBlock Grid.Column="1" Text="{Binding Size}" /></Grid>
+                                    <TextBlock Text="{Binding Detail}" Style="{StaticResource MutedTextStyle}" />
+                                    <InfoBar IsOpen="{Binding InstalledButNotEffective}" IsClosable="False" Severity="Warning" Title="已安装，但未生效" Message="文件状态不能作为生效证明。请检查会话标记与作用域覆盖。" />
+                                    <TextBlock Text="{Binding Evidence}" TextWrapping="Wrap" />
+                                    <ItemsControl ItemsSource="{Binding Notes}" ItemTemplate="{StaticResource NoteTemplate}" />
+                                    <Expander HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Header="备份详情与证据">
+                                        <StackPanel Spacing="6">
+                                            <TextBlock Text="{Binding BackupPath}" Style="{StaticResource MonoTextStyle}" />
+                                            <TextBlock Text="{Binding BackupSummary}" />
+                                            <TextBlock Text="{Binding BackupHash}" Style="{StaticResource MonoTextStyle}" />
+                                            <TextBlock Text="旧备份另存位置" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding SupersededPath}" Style="{StaticResource MonoTextStyle}" />
+                                            <TextBlock Text="污染备份另存位置" Style="{StaticResource MutedTextStyle}" /><TextBlock Text="{Binding ContaminatedCopyPath}" Style="{StaticResource MonoTextStyle}" />
+                                        </StackPanel>
+                                    </Expander>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="10">
+                        <Grid><TextBlock Text="标记命中与判读" Style="{ThemeResource SubtitleTextBlockStyle}" /><Button Content="跑自检" Command="{Binding LoadCommand}" CommandParameter="markers" HorizontalAlignment="Right" /></Grid>
+                        <TextBlock Text="{Binding MarkerSummary}" Style="{StaticResource MutedTextStyle}" />
+                        <ListView ItemsSource="{Binding Markers}" ItemTemplate="{StaticResource MarkerTemplate}" SelectionMode="None" />
+                        <TextBlock Text="{Binding Verdict}" TextWrapping="Wrap" FontWeight="SemiBold" />
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</Page>

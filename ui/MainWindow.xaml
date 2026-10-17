@@ -1,0 +1,51 @@
+<Window
+    x:Class="AgentToolkit.Ui.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Jailbreak Tool">
+    <Window.SystemBackdrop><MicaBackdrop /></Window.SystemBackdrop>
+    <Grid x:Name="RootGrid">
+        <NavigationView x:Name="Navigation" IsBackButtonVisible="Collapsed" IsSettingsVisible="False"
+                        PaneDisplayMode="Left" OpenPaneLength="220" IsPaneToggleButtonVisible="False"
+                        SelectionChanged="Navigation_SelectionChanged">
+            <NavigationView.PaneHeader>
+                <StackPanel Margin="20,24,12,20" Spacing="4">
+                    <TextBlock Text="Jailbreak" Style="{ThemeResource TitleTextBlockStyle}" />
+                    <TextBlock Text="Tool" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <ComboBox Margin="0,14,0,0" HorizontalAlignment="Stretch"
+                              ItemsSource="{Binding Targets}"
+                              SelectedItem="{Binding SelectedTarget, Mode=TwoWay}"
+                              DisplayMemberPath="Label" />
+                    <TextBlock Margin="2,8,0,0" Text="{Binding TargetSummary}" TextWrapping="Wrap"
+                               Style="{ThemeResource CaptionTextBlockStyle}"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+            </NavigationView.PaneHeader>
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="状态" Tag="Status" Icon="Home" />
+                <NavigationViewItem Content="探测与诊断" Tag="Locate" Icon="Find" />
+                <NavigationViewItemSeparator />
+                <NavigationViewItem Content="注入" Tag="Inject" Icon="Add" />
+                <NavigationViewItem Content="还原" Tag="Revert" Icon="Undo" />
+                <NavigationViewItemSeparator />
+                <NavigationViewItem Content="日志查看器" Tag="Logs" Icon="Document" />
+                <NavigationViewItem Content="差异对照" Tag="Diff" Icon="Switch" />
+                <NavigationViewItem Content="注入文本" Tag="Policy" Icon="Edit" />
+                <NavigationViewItem Content="验收台账" Tag="Probes" Icon="Accept" />
+            </NavigationView.MenuItems>
+            <NavigationView.FooterMenuItems><NavigationViewItem Content="关于" Tag="About" Icon="Help" /></NavigationView.FooterMenuItems>
+            <NavigationView.PaneFooter>
+                <StackPanel Margin="16,12,16,20" Spacing="12">
+                    <Grid x:Name="DebugHost" />
+                    <TextBlock Text="本机工作台" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+            </NavigationView.PaneFooter>
+            <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                <InfoBar Margin="28,20,28,0" IsOpen="{Binding IsMock}" IsClosable="False" Severity="Informational"
+                         Title="模拟数据" Message="当前由内存演示引擎提供数据，未连接真实客户端。" />
+                <ContentControl Grid.Row="1" Content="{Binding Content}" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch" />
+            </Grid>
+        </NavigationView>
+    </Grid>
+</Window>

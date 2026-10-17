@@ -1,0 +1,33 @@
+# ── 构建产物（一律不进库，发布物走 GitHub Releases）──
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+dist/
+installer/out/
+*.wixpdb
+*.pdb
+*.msi
+*-Setup-*.exe
+
+# ── IDE / 编辑器 ──
+.vs/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# ── 运行时数据（工具自身产生的台账、备份、注入文本）──
+probe-ledger.json
+*.breach.bak
+*.contaminated
+*.superseded
+stage/
+out/
+
+# ── 杂项 ──
+*.tmp
+*.log
+Thumbs.db
+desktop.ini

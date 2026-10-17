@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  单文件安装程序（WiX Burn 引导程序）
+
+  把 AgentToolkit-<版本>-x64.msi 作为载荷打进一个 setup.exe，双击即装。
+  用它的理由：MSI 双击虽然也能装，但用户拿到的是一个 98 MB 的 .msi，
+  有些环境（邮件网关、下载器、公司策略）会拦 .msi；一个 setup.exe 更省事。
+  装的东西完全一样——exe 只是外壳，真正的安装逻辑还在 MSI 里。
+
+  命令行（Burn 的标准开关）：
+    AgentToolkit-Setup-<版本>.exe /install /quiet /norestart
+    AgentToolkit-Setup-<版本>.exe /uninstall /quiet
+    AgentToolkit-Setup-<版本>.exe /layout <目录>      # 只解包不安装（分发/离线用）
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+
+  <Bundle
+      Name="Jailbreak Tool"
+      Version="$(var.Version)"
+      Manufacturer="Jailbreak"
+      UpgradeCode="B7E2D51C-4A83-4E17-9C6F-8D3A1F0E5B92"
+      IconSourceFile="$(var.IconPath)"
+      Compressed="yes">
+
+    <!-- 界面：标准引导程序（安装/卸载按钮 + 进度 + 完成页），logo 与产品图标同源 -->
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl=""
+          SuppressOptionsUI="yes"
+          LogoFile="$(var.LogoPath)" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <!-- Vital：MSI 失败就整体失败，不要留下半个安装。v5 里是 SourceFile，不是 Source。
+           Visible="no"：内嵌的 MSI 不在「添加/删除程序」里单独露一条——
+           否则用户会看到两条同名条目（Burn 自己那条 + MSI 那条） -->
+      <MsiPackage
+          Id="MainMsi"
+          SourceFile="$(var.MsiPath)"
+          Vital="yes"
+          Visible="no"
+          Compressed="yes" />
+    </Chain>
+  </Bundle>
+
+</Wix>

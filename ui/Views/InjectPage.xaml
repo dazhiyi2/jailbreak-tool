@@ -1,0 +1,31 @@
+<Page x:Class="AgentToolkit.Ui.Views.InjectPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:controls="using:AgentToolkit.Ui.Controls">
+    <ScrollViewer><StackPanel Padding="28,20,28,28" Spacing="16">
+        <Grid><StackPanel Spacing="4"><TextBlock Text="注入" Style="{ThemeResource TitleTextBlockStyle}" /><TextBlock Text="选项改变后需重新预览；执行使用最近一次预览的选项。" Style="{StaticResource MutedTextStyle}" /></StackPanel><Button Content="重新预览" Command="{Binding RefreshCommand}" HorizontalAlignment="Right" /></Grid>
+        <controls:PageFeedback />
+        <Border Style="{StaticResource CardStyle}"><ContentControl IsEnabled="{Binding IsInteractive}" HorizontalContentAlignment="Stretch"><StackPanel Spacing="12">
+            <TextBlock Text="注入范围" Style="{ThemeResource SubtitleTextBlockStyle}" />
+            <CheckBox Content="跳过系统提示词层" IsChecked="{Binding SkipSystemPrompt, Mode=TwoWay}" />
+            <CheckBox Content="跳过上下文指令层" IsChecked="{Binding SkipContextPayload, Mode=TwoWay}" />
+            <ToggleSwitch Header="强制处理" OnContent="已请求" OffContent="未启用" IsOn="{Binding ForceRequested, Mode=TwoWay}" />
+            <TextBlock Text="{Binding ForceLabel}" Style="{StaticResource MutedTextStyle}" />
+            <InfoBar IsOpen="{Binding ForceConfirmationOpen}" IsClosable="False" Severity="Warning" Title="再次确认强制处理" Message="确认后将把 Force=true 交给引擎。锚点冲突与备份限制仍由引擎裁定；确认后请重新预览。">
+                <StackPanel Orientation="Horizontal" Spacing="12" Margin="0,8,0,0"><Button Content="确认启用强制处理" Command="{Binding ConfirmForceCommand}" /><Button Content="取消强制处理" Command="{Binding CancelForceCommand}" /></StackPanel>
+            </InfoBar>
+            <CheckBox Content="完成后重启客户端" IsChecked="{Binding RestartClient, Mode=TwoWay}" />
+        </StackPanel></ContentControl></Border>
+        <InfoBar IsOpen="{Binding PreviewStale}" IsClosable="False" Title="请重新预览" Message="执行按钮仅在当前选项的预览通过后启用。" />
+        <InfoBar IsOpen="{Binding PreviewBlocked}" IsClosable="False" Severity="Error" Title="预览不允许执行" Message="请先解决引擎返回的诊断问题。" />
+        <StackPanel Spacing="16" Visibility="{Binding ContentVisibility}">
+            <TextBlock Text="{Binding Summary}" FontWeight="SemiBold" /><TextBlock Text="{Binding PreviewId}" Style="{StaticResource MutedTextStyle}" />
+            <TextBlock Text="计划变更" Style="{ThemeResource SubtitleTextBlockStyle}" />
+            <ListView ItemsSource="{Binding Changes}" ItemTemplate="{StaticResource ChangeTemplate}" SelectionMode="None" />
+            <Border Style="{StaticResource CardStyle}"><StackPanel Spacing="12"><TextBlock Text="统一差异预览" Style="{ThemeResource SubtitleTextBlockStyle}" /><controls:ReadOnlyTextView Text="{Binding DiffText}" Height="270" /></StackPanel></Border>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="12"><Button Content="执行注入" Command="{Binding ApplyCommand}" Style="{StaticResource AccentButtonStyle}" /><Button Content="取消执行" Command="{Binding CancelCommand}" IsEnabled="{Binding IsLoading}" /></StackPanel>
+        <InfoBar IsOpen="{Binding HasResult}" IsClosable="False" Title="执行后验证" Message="{Binding VerificationHint}" />
+        <InfoBar IsOpen="{Binding RestartRequired}" IsClosable="False" Severity="Warning" Title="改动需重启" Message="请完全退出并重启客户端，再用新会话检查标记与实际生效情况。" />
+    </StackPanel></ScrollViewer>
+</Page>

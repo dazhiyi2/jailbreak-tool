@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/backend/">
+    <Project Path="backend/AgentToolkit.Core/AgentToolkit.Core.csproj" />
+    <Project Path="backend/AgentToolkit.Engine.Cli/AgentToolkit.Engine.Cli.csproj" />
+    <Project Path="backend/AgentToolkit.SelfTest/AgentToolkit.SelfTest.csproj" />
+  </Folder>
+  <Folder Name="/ui/">
+    <Project Path="ui/AgentToolkit.Ui.csproj">
+      <Platform Project="x64" />
+    </Project>
+  </Folder>
+</Solution>

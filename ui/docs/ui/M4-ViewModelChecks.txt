@@ -1,0 +1,16 @@
+PASS four states: LocatePageViewModel
+PASS four states: StatusPageViewModel
+PASS four states: InjectPageViewModel
+PASS four states: RevertPageViewModel
+PASS four states: LogsPageViewModel
+PASS four states: DiffPageViewModel
+PASS four states: PolicyPageViewModel
+PASS four states: ProbesPageViewModel
+PASS apply preview/force confirmation/execution/options invalidation
+PASS apply cancellation keeps engine state unchanged
+PASS revert preview/remove-backup confirmation/hash evidence
+PASS per-layer mock isolation
+PASS logs search/no-match/session auto-load
+PASS policy draft retention/save/UTF-8 cap/readonly
+PASS probe validation/save/history refresh
+M4 MANAGED VIEWMODEL CHECKS PASSED

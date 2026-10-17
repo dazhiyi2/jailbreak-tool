@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- 本机只装了 .NET 10 运行时：允许 net8.0 目标向上滚动运行 -->
+    <RollForward>LatestMajor</RollForward>
+    <AssemblyName>selftest</AssemblyName>
+    <RootNamespace>AgentToolkit.SelfTest</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AgentToolkit.Core\AgentToolkit.Core.csproj" />
+  </ItemGroup>
+</Project>

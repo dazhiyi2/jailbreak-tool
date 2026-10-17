@@ -1,0 +1,13 @@
+PASS NotLocated
+PASS StockClean
+PASS AppliedHealthy
+PASS UpgradeOverwritten
+PASS AnchorAmbiguous
+PASS BackupContaminated
+PASS NoSessions
+PASS RichSession
+PASS cancellation keeps state unchanged
+PASS progress and revert preview/hash evidence
+PASS policy isolation, UTF-8 size and readonly rejection
+PASS idempotent preview size
+M2 MOCK CHECKS PASSED

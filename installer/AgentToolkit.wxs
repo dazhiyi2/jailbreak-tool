@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  破甲 · 本机配置工具 —— 安装包定义（WiX v7 / MSI）
+
+  设计取向：
+    · 每用户安装（Scope="perUser"）：装到 %LOCALAPPDATA%\Programs\AgentToolkit，不需要管理员、不弹 UAC。
+    · 绝不碰用户数据：引擎的数据目录是 %LOCALAPPDATA%\AgentToolkit（策略文本、备份、探针台账），
+      与安装目录分开。卸载只删安装目录，注入过的客户端文件与备份一律不动。
+    · 界面是自包含发布（WinUI 3 + Windows App SDK 运行时都在里面），所以装完即可运行，
+      不需要用户另外装 .NET 或 Windows App SDK Runtime。
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package
+      Name="Jailbreak Tool"
+      Manufacturer="Jailbreak"
+      Version="$(var.Version)"
+      UpgradeCode="7C4E1A62-9B3D-4F58-A1E7-2D5B8C0F6A34"
+      Language="1033"
+      Scope="perUser"
+      Compressed="yes"
+      InstallerVersion="500">
+
+    <SummaryInformation
+        Description="Jailbreak Tool $(var.Version)（多目标：DeepSeek Harness / ZCode / opencode）"
+        Manufacturer="Jailbreak" />
+
+    <!-- 图标：exe 里已用 ApplicationIcon 嵌过一份，这里再显式带一个 .ico，
+         供「添加/删除程序」与快捷方式使用（ARPPRODUCTICON + Shortcut/@Icon） -->
+    <Icon Id="AppIcon" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <!-- 「添加/删除程序」里不显示"修改"按钮（没有可选组件） -->
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- 升级：同一 UpgradeCode 的新版本直接覆盖安装 -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="已安装更新的版本；先卸载它再装这个。" />
+
+    <!-- 全部内容打进一个内嵌 cab -->
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="JailbreakTool" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="Jailbreak Tool" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Jailbreak Tool" Level="1">
+      <ComponentGroupRef Id="GuiFiles" />
+      <ComponentGroupRef Id="CliFiles" />
+      <ComponentGroupRef Id="DocFiles" />
+      <ComponentRef Id="GuiShortcut" />
+    </Feature>
+  </Package>
+
+  <!-- 组件表由 build-installer.ps1 逐文件生成：每个文件一个组件、以 HKCU 注册表键为 KeyPath
+       （ICE38：perUser 装进用户配置目录的组件不能用文件当 KeyPath） -->
+  <?include "$(var.StageDir)\components.wxs"?>
+
+  <!-- 文档子目录（组件表里 DocFiles 组指向它） -->
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Directory Id="DocsFolder" Name="docs" />
+    </DirectoryRef>
+  </Fragment>
+
+  <!-- 开始菜单：图形界面 + 命令行引擎 + 文档目录 -->
+  <Fragment>
+    <DirectoryRef Id="AppMenuFolder">
+      <Component Id="GuiShortcut" Guid="A1F5C3D8-6E24-4B90-8C71-5F2E9A0D4B18">
+        <Shortcut Id="GuiShortcutLink"
+            Name="Jailbreak Tool"
+            Description="Jailbreak Tool（图形界面）"
+            Target="[INSTALLFOLDER]JailbreakTool.exe"
+            Icon="AppIcon"
+            WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="CliShortcutLink"
+            Name="Jailbreak CLI"
+            Description="engine.exe —— 定位 / 状态 / 注入 / 还原 / 会话判读"
+            Target="[INSTALLFOLDER]Jailbreak-CLI.cmd"
+            Icon="AppIcon"
+            WorkingDirectory="INSTALLFOLDER" />
+        <Shortcut Id="DocsShortcutLink"
+            Name="Jailbreak 文档"
+            Description="README 与各目标档案、验收记录"
+            Icon="AppIcon"
+            Target="[DocsFolder]" />
+        <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\AgentToolkit" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+</Wix>

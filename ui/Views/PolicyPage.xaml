@@ -1,0 +1,16 @@
+<Page x:Class="AgentToolkit.Ui.Views.PolicyPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:controls="using:AgentToolkit.Ui.Controls">
+    <Grid Padding="28,20,28,28" RowSpacing="16">
+        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+        <Grid><StackPanel Spacing="4"><TextBlock Text="注入文本" Style="{ThemeResource TitleTextBlockStyle}" /><TextBlock Text="编辑系统前缀、系统后缀与上下文载荷；草稿在当前窗口内保留。" Style="{StaticResource MutedTextStyle}" /></StackPanel><Button Content="刷新文本" Command="{Binding RefreshCommand}" HorizontalAlignment="Right" /></Grid>
+        <controls:PageFeedback Grid.Row="1" />
+        <InfoBar Grid.Row="2" IsOpen="{Binding SelectedFile.OverCap}" IsClosable="False" Severity="Error" Title="文本超过体积上限" Message="体积按 UTF-8 实时计算。请缩减文本后再保存。" />
+        <Border Grid.Row="3" Style="{StaticResource CardStyle}" Visibility="{Binding ContentVisibility}">
+            <StackPanel Spacing="10"><ComboBox Header="文本文件" ItemsSource="{Binding Files}" DisplayMemberPath="DisplayName" SelectedItem="{Binding SelectedFile, Mode=TwoWay}" IsEnabled="{Binding IsInteractive}" HorizontalAlignment="Stretch" /><TextBlock Text="{Binding SelectedFile.Path}" Style="{StaticResource MonoTextStyle}" /><Grid><TextBlock Text="{Binding SelectedFile.Size}" /><TextBlock Text="{Binding SelectedFile.Editability}" HorizontalAlignment="Right" Style="{StaticResource MutedTextStyle}" /></Grid></StackPanel>
+        </Border>
+        <TextBox Grid.Row="4" Text="{Binding SelectedFile.Text, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Visibility="{Binding ContentVisibility}" FontFamily="Cascadia Mono, Consolas" IsReadOnly="{Binding SelectedFile.IsReadOnly}" IsEnabled="{Binding IsInteractive}" AcceptsReturn="True" TextWrapping="Wrap" VerticalAlignment="Stretch" ScrollViewer.VerticalScrollBarVisibility="Auto" />
+        <Button Grid.Row="5" Content="保存所选文本" Command="{Binding SaveCommand}" Style="{StaticResource AccentButtonStyle}" />
+    </Grid>
+</Page>

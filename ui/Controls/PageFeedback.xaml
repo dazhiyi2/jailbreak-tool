@@ -1,0 +1,24 @@
+<!-- 用途：统一页面的加载、空数据、错误与引擎诊断提示。 -->
+<UserControl
+    x:Class="AgentToolkit.Ui.Controls.PageFeedback"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <StackPanel Spacing="8">
+        <StackPanel Orientation="Horizontal" Spacing="12" Visibility="{Binding LoadingVisibility}">
+            <ProgressRing IsActive="{Binding IsLoading}" Width="24" Height="24" />
+            <TextBlock Text="{Binding ProgressMessage}" VerticalAlignment="Center" TextWrapping="Wrap" />
+            <Button Content="取消" Command="{Binding CancelCommand}" />
+        </StackPanel>
+        <ProgressBar Visibility="{Binding LoadingVisibility}" IsIndeterminate="{Binding IsProgressIndeterminate}" Value="{Binding ProgressValue}" Maximum="100" />
+        <InfoBar IsOpen="{Binding HasMessage}" IsClosable="False" Severity="{Binding MessageSeverity}" Title="{Binding MessageTitle}" Message="{Binding MessageDetail}" />
+        <InfoBar IsOpen="{Binding HasError}" IsClosable="False" Severity="Error" Title="{Binding ErrorTitle}" Message="{Binding ErrorDetail}" />
+        <Border Style="{StaticResource CardStyle}" Visibility="{Binding EmptyVisibility}">
+            <StackPanel Spacing="12">
+                <TextBlock Text="暂无数据" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                <TextBlock Text="{Binding EmptyMessage}" TextWrapping="Wrap" />
+                <Button Content="重新加载" Command="{Binding RefreshCommand}" />
+            </StackPanel>
+        </Border>
+        <ItemsControl ItemsSource="{Binding Notes}" ItemTemplate="{StaticResource NoteTemplate}" />
+    </StackPanel>
+</UserControl>

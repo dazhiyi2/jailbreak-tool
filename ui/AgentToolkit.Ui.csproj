@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>AgentToolkit.Ui</RootNamespace>
+    <!-- 产品名与图标：Jailbreak Tool（图标源图在 ui\app.ico，多尺寸 16/32/48/64/128） -->
+    <AssemblyName>JailbreakTool</AssemblyName>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <PublishSingleFile>false</PublishSingleFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+  </ItemGroup>
+  <!-- 冻结契约的唯一来源移到 Core（同一个文件被链接编译），这里必须排除自身的隐式包含，
+       否则会产出第二个 IAgentEngine 类型身份，两边无法赋值。 -->
+  <ItemGroup>
+    <Compile Remove="Contracts\EngineContracts.cs" />
+    <ProjectReference Include="..\backend\AgentToolkit.Core\AgentToolkit.Core.csproj" />
+  </ItemGroup>
+
+  <!-- 未打包 WinUI 的 XAML 生成资源必须跟随文件夹发布，不能只发布程序集。 -->
+  <Target Name="IncludeWinUiResourcesInPublish" AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <_UiPublishResources Include="$(TargetDir)**\*.xbf;$(TargetDir)$(TargetName).pri"
+                           Exclude="$(TargetDir)publish\**\*" />
+      <ResolvedFileToPublish Include="@(_UiPublishResources)" Exclude="@(ResolvedFileToPublish)">
+        <RelativePath>%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
+</Project>

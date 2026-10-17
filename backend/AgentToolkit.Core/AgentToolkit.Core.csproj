@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AgentToolkit.Core</RootNamespace>
+    <AssemblyName>AgentToolkit.Core</AssemblyName>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- 冻结契约：单一来源在 UI 侧，这里只链接，绝不复制，避免产生第二个类型身份 -->
+  <ItemGroup>
+    <Compile Include="..\..\ui\Contracts\EngineContracts.cs" Link="Contracts\EngineContracts.cs" />
+  </ItemGroup>
+
+  <!-- 注入文本内嵌进单文件 exe，首次运行物化到本机数据目录供编辑 -->
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- DSH 会话日志是多帧 zstd；纯托管实现，无原生依赖 -->
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.*" />
+    <!-- DSH 补丁层（cordis.patch.yml）改完必须用真实解析器自检 -->
+    <PackageReference Include="YamlDotNet" Version="16.*" />
+    <!-- opencode 的会话与推理存在 SQLite（opencode.db，WAL）：只读读取 -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.*" />
+  </ItemGroup>
+</Project>

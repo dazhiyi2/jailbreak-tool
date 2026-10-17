@@ -19,10 +19,10 @@
 |---|---|---|---|---|
 | **DeepSeek Harness** 44.x | 打包 Electron | profile 补丁层按 row id 覆写（含 agent preset 覆写行） | `$DSH_HOME\AGENTS.md`（有效上限 64 KB） | `sessions\**\session.v4.jsonl.zstd`（多帧 zstd） |
 | **ZCode** 3.14.x | 明文提示词的本地应用 | `resources\glm\zcode.cjs` 五道字符串补丁 | `~/.zcode/AGENTS.md`（上限 100 KB） | `~/.zcode/cli/rollout/model-io-sess_*.jsonl`（明文） |
-| **opencode** 2.0.x | 打包 Electron + Bun 单文件 CLI | **客户端里没有可删的安全条款**（同 DSH 型）→ 走官方配置通道 `opencode.json` 的 `instructions` | `~/.config/opencode/AGENTS.md`（全局） | `~/.local/share/opencode/opencode.db`（SQLite；推理在 `session_message.data.content[].text`，生效证据在 `instruction_blob`） |
+| **opencode** 2.0.x | 打包 Electron + Bun 单文件 CLI | **客户端里没有可删的安全条款**（同 DSH 型）→ 走官方配置通道：系统层 `agent.<名字>.prompt`（**关键层**）+ 配置指令层 `opencode.json` 的 `instructions` | `~/.config/opencode/AGENTS.md`（全局，**会被降级成"本机偏好"**） | `~/.local/share/opencode/opencode.db`（SQLite；推理在 `session_message.data.content[].text`，生效证据在 `instruction_blob`） |
 | **Google Antigravity**（Gemini）2.24.x | VS Code 分支 + 原生语言服务器（163.5 MB Go 二进制） | **本地评审员提示词明文在二进制里**，走等长字节补丁（工具在 `tools\patch-antigravity.ps1`，不在引擎里） | `~/.gemini/config/rules/AGENTS.md`（单文件上限 24 KB） | `~/.gemini/antigravity/conversations/*.db`（SQLite；推理在 `steps.step_payload` 的 protobuf，`step_type=15` 的 `.20.3`） |
 
-> opencode 的阶段 0 侦察与适配器均已完成（见 [docs/opencode.md](docs/opencode.md)）：提示词在 203.8 MB 的 Bun 单文件里但**没有安全条款**，所以不做补丁层；注入走官方配置通道 `instructions` + 全局 `AGENTS.md`。
+> opencode 的阶段 0 侦察与适配器均已完成（见 [docs/opencode.md](docs/opencode.md)）：提示词在 203.8 MB 的 Bun 单文件里但**没有安全条款**，所以不做补丁层；注入走官方配置通道。**三个通道的权力排序是实测出来的**：系统层 `agent.<名字>.prompt` 被当硬性规定执行；`instructions` 与 `AGENTS.md` 会被归类成"文件"，后者甚至被模型点名驳回为"本机偏好"。而且**系统层里也不能自我声明权威**——"与系统提示词同级"这类自证加上强制校验标记，会被直接指认成注入。
 > 它在三个目标里验证条件最好：`instruction_blob` 记录的是**真正进了模型上下文的常驻指令载荷**，所以"命中数自检"直接查"模型被告知了什么"，而不是靠聊天记录里数标记。**真实端到端已跑通**（apply → 开新会话 → blob 从 4 条涨到 6 条、命中 7 次 → revert 逐字节回厂）。
 
 目标是**适配器**：加一个客户端 = 加一个 `ITargetAdapter`，界面与引擎不动。

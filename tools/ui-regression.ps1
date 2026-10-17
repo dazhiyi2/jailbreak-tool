@@ -166,7 +166,16 @@ foreach ($p in $pages) {
 Write-Host "`n== 状态页的真实引擎数据 ==" -ForegroundColor Cyan
 [void](Select-Nav $root '状态')
 $s = (Get-Texts $root) -join "`n"
-if ($s -match '44\.0\.0') { Ok "显示 DSH 版本 44.0.0" } else { Bad "状态页没显示 44.0.0" }
+# 不写死版本号：DSH 会自升级（实测从 44.0.0 到 44.7.0），写死会变成假警报。
+# 判据改成「状态页出现形如 x.y.z 的版本号」，并从引擎取真实版本做交叉核对。
+if ($s -match '\d+\.\d+\.\d+') { Ok "显示版本号（形如 x.y.z）" } else { Bad "状态页没显示版本号" }
+$engExe = Join-Path (Split-Path -Parent $Exe) 'engine.exe'
+if (Test-Path $engExe) {
+  $ver = ((& $engExe targets 2>&1 | Select-String '^\s*[^\s]*\s+dsh\s') -split '\s+') | Where-Object { $_ -match '^\d+\.\d+\.\d+$' } | Select-Object -First 1
+  if ($ver -and ($s -match [regex]::Escape($ver))) { Ok "状态页版本号与引擎一致（$ver）" }
+  elseif ($ver) { Bad "状态页版本号与引擎不一致（引擎 $ver）" }
+  else { Info "版本号交叉核对跳过（未从引擎解析到 dsh 版本）" }
+} else { Info "版本号交叉核对跳过（$engExe 不存在）" }
 if ($s -match '已注入') { Ok "显示「已注入」" } else { Bad "状态页没显示「已注入」" }
 if ($s -match '备份干净') { Ok "显示「备份干净」" } else { Bad "状态页没显示备份健康度" }
 if ($s -match '运行中') { Ok "显示客户端进程状态" } else { Bad "状态页没显示进程状态" }

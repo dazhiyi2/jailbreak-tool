@@ -63,6 +63,7 @@ $docMap = @{
   'docs\zcode.md'   = 'zcode.md'
   'docs\opencode.md'= 'opencode.md'
   'docs\gemini.md'  = 'gemini.md'
+  'docs\cursor.md'  = 'cursor.md'
   'docs\probes.md'  = 'probes.md'
   'docs\verification.md' = 'verification.md'
 }

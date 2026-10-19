@@ -57,6 +57,7 @@ public sealed class CursorTarget : ITargetAdapter
     /// </summary>
     public static IReadOnlyList<PolicyTextDef> PolicyDefs { get; } = new[]
     {
+        // ---- A 套（own）：现有注入文本，一个字未改 ----
         new PolicyTextDef
         {
             Name = "payload",
@@ -73,7 +74,39 @@ public sealed class CursorTarget : ITargetAdapter
             ResourceSuffix = "cursor.personal.md",
             CapBytes = CursorRules.PerFileCapBytes,
         },
+
+        // ---- B 套（protocol）：载体槽 = personal（state.vscdb 个人规则层），放 gpt-instruct 原文（逐字节）；
+        //      payload 是空槽：不写 breach.mdc，A 套遗留的由清理计划移除。
+        new PolicyTextDef
+        {
+            Name = "personal",
+            DisplayName = "个人规则层正文（state.vscdb → aicontext.personalContext）· gpt-instruct 原文",
+            FileName = "cursor.personal.schemeB.md",
+            ResourceSuffix = SchemeBProtocolSuffix,
+            CapBytes = CursorRules.PerFileCapBytes,
+            Scheme = InjectionScheme.Protocol,
+        },
+        new PolicyTextDef
+        {
+            Name = "payload",
+            DisplayName = "项目规则层正文（protocol 方案下为空槽：不注入）",
+            FileName = "cursor.payload.schemeB.md",
+            ResourceSuffix = SchemeBEmptySuffix,
+            Required = false,
+            Editable = false,
+            Scheme = InjectionScheme.Protocol,
+        },
     };
+
+    private const string SchemeBProtocolSuffix = "schemeB.protocol.md";
+    private const string SchemeBEmptySuffix = "schemeB.empty.md";
+
+    private Note SchemeNote(InjectionScheme scheme) => Notes.Info("注入方案",
+        scheme == InjectionScheme.Protocol
+            ? "当前 protocol（gpt-instruct 原文，逐字节不动）；载体槽 = personal（state.vscdb 的个人规则层）；" +
+              "空槽 = payload（.cursor\\rules\\breach.mdc 不注入；A 套遗留的会被 apply 移除）；补丁层与方案无关，照打。"
+            : "当前 own（本工具方案）；个人规则层 + 项目规则层都注入；补丁层与方案无关，照打。",
+        Ctx.Policy.SchemePath);
 
     // ================================================================ 定位 / 描述
 
@@ -156,12 +189,16 @@ public sealed class CursorTarget : ITargetAdapter
         var loc = Peek(ct);
         var notes = new List<Note>(loc.Notes.Where(n => n.Severity != Severity.Info));
 
-        var personal = SafePolicyText("personal");
-        var payloadBody = SafePolicyText("payload");
+        var scheme = Ctx.ActiveScheme(out var schemeNote);
+        if (schemeNote is not null) notes.Add(Notes.Warn("方案文件", schemeNote, Ctx.Policy.SchemePath));
+        notes.Add(SchemeNote(scheme));
+
+        var personal = SafePolicyText("personal", scheme);
+        var payloadBody = SafePolicyText("payload", scheme);
 
         var patchLayer = PatchLayerStatus(loc, notes);
-        var dbLayer = DbLayerStatus(loc, personal, notes);
-        var rulesLayer = RulesLayerStatus(loc, payloadBody, notes);
+        var dbLayer = DbLayerStatus(loc, personal, notes, scheme);
+        var rulesLayer = RulesLayerStatus(loc, payloadBody, notes, scheme);
 
         // ---- 日志层（只读）----
         var sessions = ReadSessions(loc, notes);
@@ -337,7 +374,7 @@ public sealed class CursorTarget : ITargetAdapter
     }
 
     /// <summary>层 2：个人规则层（state.vscdb → ItemTable → aicontext.personalContext）。</summary>
-    private LayerStatus DbLayerStatus(CursorLocation loc, string personal, List<Note> notes)
+    private LayerStatus DbLayerStatus(CursorLocation loc, string personal, List<Note> notes, InjectionScheme scheme)
     {
         var dbPath = loc.DbPath;
         var layer = new LayerStatus
@@ -399,12 +436,17 @@ public sealed class CursorTarget : ITargetAdapter
         else if (layer.State == LayerState.Applied && assess.Status == BackupStatus.Absent)
             extra.Add(Notes.Warn("没有备份",
                 "当前键已是注入态但没有备份：还原只能走逆向撤销（原本键不存在 → 删掉那一行）。", dbPath));
+        extra.Add(Notes.Info("注入方案",
+            scheme == InjectionScheme.Protocol
+                ? "protocol 方案：载体槽 = personal（本层的 aicontext.personalContext），写入 gpt-instruct 原文（逐字节）；" +
+                  "空槽 = payload（.cursor\\rules\\breach.mdc 不注入，A 套遗留的由 apply 移除）。"
+                : "own 方案：个人规则层与项目规则层都注入（本层是 personal）。", dbPath));
         layer.Notes = layer.Notes.Concat(extra).ToArray();
         return layer;
     }
 
     /// <summary>层 3：项目规则层（&lt;工作区&gt;\.cursor\rules\breach.mdc）。</summary>
-    private LayerStatus RulesLayerStatus(CursorLocation loc, string payloadBody, List<Note> notes)
+    private LayerStatus RulesLayerStatus(CursorLocation loc, string payloadBody, List<Note> notes, InjectionScheme scheme)
     {
         var layer = new LayerStatus
         {
@@ -413,6 +455,7 @@ public sealed class CursorTarget : ITargetAdapter
             TargetPath = loc.WorkspaceDir is null ? null : loc.RulesPath,
             CapBytes = CursorRules.PerFileCapBytes,
         };
+        var emptySlot = Ctx.IsEmptySlot("payload", scheme);
 
         if (loc.WorkspaceDir is null)
         {
@@ -436,11 +479,17 @@ public sealed class CursorTarget : ITargetAdapter
         layer.SizeBytes = text is null ? 0 : FileText.Bytes(text);
         var ours = CursorMarkers.IsOurs(text);
         layer.State = text is null ? LayerState.TargetAbsent : ours ? LayerState.Applied : LayerState.NotApplied;
-        layer.StateDetail = text is null
-            ? $"breach.mdc 不存在：首次 apply 会创建它（{loc.RulesPath}）。"
-            : ours
-                ? "breach.mdc 存在且含本工具的注入标记（alwaysApply: true → 正文进提示词）。"
-                : "breach.mdc 存在，但内容不是本工具的规则（用户自己的文件，apply 会先备份）。";
+        layer.StateDetail = emptySlot
+            ? (text is null
+                ? "protocol 方案下 payload 是空槽：不写 breach.mdc（目标位置本来没有文件）。"
+                : ours
+                    ? "protocol 方案下 payload 是空槽：不注入；盘上这份是本工具写的，apply 会移除它。"
+                    : "protocol 方案下 payload 是空槽：不注入；盘上这份不是本工具写的，一律不动。")
+            : text is null
+                ? $"breach.mdc 不存在：首次 apply 会创建它（{loc.RulesPath}）。"
+                : ours
+                    ? "breach.mdc 存在且含当前方案的注入标记（alwaysApply: true → 正文进提示词）。"
+                    : "breach.mdc 存在，但内容不是本工具当前方案的规则（用户自己的文件，apply 会先备份）。";
 
         var bak = new BackupManager(loc.RulesPath);
         var assess = bak.Assess(CursorMarkers.BackupMarkers);
@@ -460,7 +509,9 @@ public sealed class CursorTarget : ITargetAdapter
                 $"客户端**没有**给 .mdc 明文上限，{FileText.Human(CursorRules.PerFileCapBytes)} 是本工具自设的保守上限" +
                 "（rules 档本机实测 10.5 KB，注入文本必须远小于它）。", loc.RulesPath),
             Notes.Info("注入文本",
-                $"正文 {FileText.Bytes(payloadBody)} 字节（policy\\cursor.payload.md）。", loc.RulesPath),
+                emptySlot
+                    ? "protocol 方案下 payload 是空槽：本层不注入（.mdc 不写；A 套遗留的按标记判定后移除）。"
+                    : $"正文 {FileText.Bytes(payloadBody)} 字节（当前方案的注入文本）。", loc.RulesPath),
         };
         layer.Notes = layer.Notes.Concat(extra).ToArray();
 
@@ -528,6 +579,8 @@ public sealed class CursorTarget : ITargetAdapter
         public bool PatchEnabled { get; init; }
         public bool DbEnabled { get; init; }
         public bool RulesEnabled { get; init; }
+        /// <summary>空槽清理计划（protocol 方案下 payload 为空槽时，移除 A 套遗留的 breach.mdc）。</summary>
+        public SlotRemovalPlan? RulesRemoval { get; init; }
         public required string PersonalText { get; init; }
         public required string PayloadBody { get; init; }
         public required string PreviewId { get; init; }
@@ -541,7 +594,8 @@ public sealed class CursorTarget : ITargetAdapter
             RulesEnabled && Rules.WorkspaceKnown && Rules.WillWrite && Problems.Count == 0;
 
         public bool AnyWrite => Problems.Count == 0 &&
-                                (Enumerable.Range(0, PatchFiles.Count).Any(PatchWillWrite) || DbWillWrite || RulesWillWrite);
+                                (Enumerable.Range(0, PatchFiles.Count).Any(PatchWillWrite) || DbWillWrite || RulesWillWrite ||
+                                 RulesRemoval is { WillWrite: true });
 
         public IReadOnlyList<PlannedChange> Changes()
         {
@@ -601,24 +655,32 @@ public sealed class CursorTarget : ITargetAdapter
                 },
             });
 
-            list.Add(new PlannedChange
+            if (RulesRemoval is not null)
             {
-                Path = Rules.Path,
-                Layer = LayerKind.ContextPayload,
-                WillWrite = RulesWillWrite,
-                BeforeBytes = Rules.BeforeBytes,
-                AfterBytes = RulesWillWrite ? Rules.AfterBytes : Rules.BeforeBytes,
-                BackupPath = Rules.Existing is not null && Rules.Path.Length > 0 ? Rules.Path + ".breach.bak" : null,
-                DiffText = RulesWillWrite && Rules.Existing is not null
-                    ? DiffBuilder.ToUnifiedText(DiffBuilder.Build(Rules.Existing, Rules.Text).lines)
-                    : null,
-                Notes = new[]
+                var removal = SchemeSlotFile.Change(RulesRemoval, LayerKind.ContextPayload, "protocol 方案的 payload 空槽");
+                if (removal is not null) list.Add(removal);
+            }
+            else
+            {
+                list.Add(new PlannedChange
                 {
-                    Notes.Info("项目规则层", Rules.Note, Rules.Path.Length > 0 ? Rules.Path : Loc.ConfigHome),
-                    Notes.Info("frontmatter", "description + alwaysApply: true（alwaysApply 是正文进提示词的开关）。",
-                        Rules.Path.Length > 0 ? Rules.Path : Loc.ConfigHome),
-                },
-            });
+                    Path = Rules.Path,
+                    Layer = LayerKind.ContextPayload,
+                    WillWrite = RulesWillWrite,
+                    BeforeBytes = Rules.BeforeBytes,
+                    AfterBytes = RulesWillWrite ? Rules.AfterBytes : Rules.BeforeBytes,
+                    BackupPath = Rules.Existing is not null && Rules.Path.Length > 0 ? Rules.Path + ".breach.bak" : null,
+                    DiffText = RulesWillWrite && Rules.Existing is not null
+                        ? DiffBuilder.ToUnifiedText(DiffBuilder.Build(Rules.Existing, Rules.Text).lines)
+                        : null,
+                    Notes = new[]
+                    {
+                        Notes.Info("项目规则层", Rules.Note, Rules.Path.Length > 0 ? Rules.Path : Loc.ConfigHome),
+                        Notes.Info("frontmatter", "description + alwaysApply: true（alwaysApply 是正文进提示词的开关）。",
+                            Rules.Path.Length > 0 ? Rules.Path : Loc.ConfigHome),
+                    },
+                });
+            }
 
             return list;
         }
@@ -629,15 +691,21 @@ public sealed class CursorTarget : ITargetAdapter
         ct.ThrowIfCancellationRequested();
         var loc = Peek(ct);
         var problems = new List<string>();
+        var scheme = Ctx.ActiveScheme(out _);
 
-        var personal = SafePolicyText("personal");
+        var personal = SafePolicyText("personal", scheme);
+        var personalDef = Ctx.DefFor("personal", scheme);
         if (string.IsNullOrWhiteSpace(personal))
-            problems.Add($"「个人规则层」文本为空：{Ctx.Policy.PathOf(PolicyDefs.First(d => d.Name == "personal"))}（拒绝写入空文本）。");
+            problems.Add($"「个人规则层」文本为空：{(personalDef is null ? Ctx.Policy.PathOf(PolicyDefs.First(d => d.Name == "personal")) : Ctx.Policy.PathOf(personalDef))}（拒绝写入空文本）。");
         else if (FileText.Bytes(personal) >= CursorRules.PerFileCapBytes)
             problems.Add($"「个人规则层」文本 {FileText.Human(FileText.Bytes(personal))} 超过本工具自设上限 " +
                          $"{FileText.Human(CursorRules.PerFileCapBytes)}：拒绝写入。");
 
-        var payloadBody = ReadPolicyText(options.PayloadPath, "payload", required: !options.SkipContextPayload);
+        // 空槽（protocol 方案的 payload）：不写 .mdc、不产生计划变更；A 套遗留的本工具文件由清理计划移除。
+        var payloadEmptySlot = !options.SkipContextPayload && Ctx.IsEmptySlot("payload", scheme);
+        var payloadBody = options.SkipContextPayload
+            ? ""
+            : ReadPolicyText(options.PayloadPath, "payload", required: !payloadEmptySlot, scheme);
 
         var patchEnabled = !options.SkipSystemPrompt;
         var patchPlans = new List<CursorPatchFilePlan>();
@@ -666,9 +734,14 @@ public sealed class CursorTarget : ITargetAdapter
         var keyValue = snap?.KeyValue;
         var keyDiffers = dbEnabled && dbExists && !(keyPresent && string.Equals(keyValue, personal, StringComparison.Ordinal));
 
-        var rulesEnabled = !options.SkipContextPayload;
+        var rulesEnabled = !options.SkipContextPayload && !payloadEmptySlot;
         var rules = CursorRules.Plan(loc.WorkspaceDir ?? "", payloadBody, skip: !rulesEnabled, out var rulesProblem);
         if (rulesProblem is not null && rulesEnabled) problems.Add(rulesProblem);
+        SlotRemovalPlan? rulesRemoval = null;
+        if (payloadEmptySlot && loc.WorkspaceDir is not null)
+            rulesRemoval = SchemeSlotFile.Plan(rules.Path,
+                SchemeMarkers.Union(CursorMarkers.BackupMarkers),
+                "protocol 方案的 payload 是空槽（目标位置不应有本工具的文件）");
 
         var idInput = string.Join("\n", new[]
         {
@@ -690,21 +763,24 @@ public sealed class CursorTarget : ITargetAdapter
             PatchEnabled = patchEnabled,
             DbEnabled = dbEnabled,
             RulesEnabled = rulesEnabled,
+            RulesRemoval = rulesRemoval,
             PersonalText = personal,
             PayloadBody = payloadBody,
             PreviewId = FileText.Sha256Text(idInput)[..16],
         };
     }
 
-    private string SafePolicyText(string name)
+    private string SafePolicyText(string name) => SafePolicyText(name, Ctx.ActiveScheme());
+
+    private string SafePolicyText(string name, InjectionScheme scheme)
     {
-        var def = Ctx.Def(name);
+        var def = Ctx.DefFor(name, scheme);
         if (def is null) return "";
         try { return Ctx.Policy.Read(def) ?? ""; }
         catch { return ""; }
     }
 
-    private string ReadPolicyText(string? overridePath, string defName, bool required)
+    private string ReadPolicyText(string? overridePath, string defName, bool required, InjectionScheme scheme)
     {
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
@@ -714,7 +790,7 @@ public sealed class CursorTarget : ITargetAdapter
             return "";
         }
 
-        var def = Ctx.Def(defName)
+        var def = Ctx.DefFor(defName, scheme)
                   ?? throw new AgentEngineException(EngineErrorCode.Unsupported, $"没有名为「{defName}」的注入文本。");
         var text = Ctx.Policy.Read(def);
         if (text is null)
@@ -978,6 +1054,21 @@ public sealed class CursorTarget : ITargetAdapter
         else if (plan.RulesEnabled)
         {
             notes.Add(Notes.Info("幂等", $"项目规则层：{plan.Rules.Note}", plan.Rules.Path));
+        }
+
+        // ---- 空槽清理（protocol 方案：payload 不注入，A 套遗留的 breach.mdc 要移除） ----
+        if (plan.RulesRemoval is { WillWrite: true } leftover)
+        {
+            progress?.Report(new EngineProgress { Stage = "cleanup", Message = "移除另一套方案遗留的 breach.mdc", Fraction = 0.95 });
+            var deleted = SchemeSlotFile.Execute(leftover);
+            wrote |= deleted;
+            notes.Add(deleted
+                ? Notes.Info("已移除遗留文件", leftover.Note, leftover.Path)
+                : Notes.Warn("移除遗留文件失败", leftover.Note + "（删除失败，请手工核对）", leftover.Path));
+        }
+        else if (plan.RulesRemoval is { } planned)
+        {
+            notes.Add(Notes.Info("空槽", planned.Note, planned.Path));
         }
 
         // ---- 基线 ----
@@ -1595,10 +1686,11 @@ public sealed class CursorTarget : ITargetAdapter
     {
         ct.ThrowIfCancellationRequested();
         var loc = Peek(ct);
+        var specs = CursorMarkers.SpecsForScheme(Ctx.ActiveScheme());
         var session = ResolveSession(loc, sessionId, ct);
         var text = CursorDb.SessionText(loc.DbPath, session.Id);
 
-        var report = MarkerScanner.Scan(session.Id, text, CursorMarkers.MarkerSpecs);
+        var report = MarkerScanner.Scan(session.Id, text, specs);
         var total = report.Hits.Sum(h => h.Count);
         var patchHits = report.Hits.Where(h => h.Layer == MarkerLayer.WrapperOrGuidance).Sum(h => h.Count);
         var payloadHits = report.Hits.Where(h => h.Layer == MarkerLayer.ContextPayload).Sum(h => h.Count);
@@ -1651,7 +1743,7 @@ public sealed class CursorTarget : ITargetAdapter
             Lines = lines,
             AddedLines = added,
             RemovedLines = removed,
-            MarkerDelta = CursorMarkers.MarkerSpecs
+            MarkerDelta = CursorMarkers.SpecsForScheme(Ctx.ActiveScheme())
                 .Select(s => new MarkerHit
                 {
                     Marker = s.Marker,

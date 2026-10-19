@@ -8,7 +8,7 @@
 
 [CmdletBinding()]
 param(
-  [string]$Version = '1.0.4',
+  [string]$Version = '1.1.0',
   [string]$Stage = "$env:TEMP\agent-toolkit-stage",
   [string]$OutDir = '',
   [switch]$SkipPublish,
@@ -64,6 +64,7 @@ $docMap = @{
   'docs\opencode.md'= 'opencode.md'
   'docs\gemini.md'  = 'gemini.md'
   'docs\cursor.md'  = 'cursor.md'
+  'docs\codex.md'   = 'codex.md'
   'docs\probes.md'  = 'probes.md'
   'docs\verification.md' = 'verification.md'
 }

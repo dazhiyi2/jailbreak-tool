@@ -61,6 +61,9 @@ public sealed class DshSelfTest : ITargetSelfTest
             return r;
         }
 
+        // 真实客户端的只读快照：自检全程只读（不写、不 touch），结束时变化项必须为 0。
+        var realSnapshot = DualScheme.CaptureReal("dsh");
+
         try
         {
             Case1FactoryNotApplied(ctx, realAsar, ct, r);
@@ -72,6 +75,7 @@ public sealed class DshSelfTest : ITargetSelfTest
             Case7FailClosed(ctx, realAsar, ct, r);
             Case8MjsEquivalence(ctx, realAsar, ct, r);
             Case9Effectiveness(ctx, realAsar, ct, r);
+            Case10DualScheme(ctx, realAsar, ct, r);
         }
         finally
         {
@@ -90,6 +94,7 @@ public sealed class DshSelfTest : ITargetSelfTest
             r.Step("真实补丁层不存在，跳过「不写真实目标」的哈希比对。");
         }
 
+        DualScheme.CheckRealReadOnly(r, "dsh", realSnapshot);
         return r;
     }
 
@@ -484,6 +489,121 @@ public sealed class DshSelfTest : ITargetSelfTest
         if (s is null) return "(null)";
         var one = s.Replace("\r", " ").Replace("\n", " ");
         return one.Length <= n ? one : one[..n] + "…";
+    }
+
+    // ---------------------------------------------------------------- 用例 10：双注入方案
+    /// <summary>
+    /// own / protocol 双方案：选择器、载体槽、A 套遗留清理、双向切换、幂等、revert、verbatim、fail-closed、标记。
+    /// 全部在沙箱里跑；ASAR 只读真实文件（preset 结构复刻需要）。
+    /// </summary>
+    private static void Case10DualScheme(SelfTestContext ctx, string asar, CancellationToken ct, SelfTestResult r)
+    {
+        r.Step("\n[10] 双注入方案（own / protocol）");
+        DualScheme.Verbatim(r, "dsh");
+
+        // 1 缺省 = own，且行为与改动前一致
+        var sb = Setup(ctx, asar, FactoryPatch);
+        DualScheme.SelectorMissingIsOwn(r, sb.Adapter.Ctx, "dsh");
+
+        var ownPreview = sb.Adapter.PreviewApply(new ApplyOptions(), ct);
+        r.Check(ownPreview.CanApply, "own 方案预览可执行");
+        var ownApply = sb.Adapter.Apply(new ApplyOptions(), null, ct);
+        r.Check(ownApply.Applied, "own 方案 apply 写入（回归）");
+        var agents = Path.Combine(sb.Home, "AGENTS.md");
+        r.Check(File.Exists(agents), "own 方案照旧部署 AGENTS.md");
+        r.Check(FileText.Count(FileText.Read(sb.PatchPath), DshPatcher.MarkBegin) == 1, "own 方案照旧写受管段");
+        var ownAgain = sb.Adapter.Apply(new ApplyOptions(), null, ct);
+        r.Check(!ownAgain.Changes.Any(c => c.WillWrite), "own 方案连续两次 apply：WillWrite 全 false");
+
+        // 2 切 protocol：方案可见、载体槽解析到 B 套
+        DualScheme.SwitchToProtocol(r, sb.Adapter.Ctx, "dsh", "prefix");
+        var protoPreview = sb.Adapter.PreviewApply(new ApplyOptions(), ct);
+        r.Check(protoPreview.Changes.Any(c => c.Layer == LayerKind.SystemPrompt), "B 方案预览含系统提示词层");
+        r.Check(protoPreview.Changes.Any(c => c.Layer == LayerKind.ContextPayload && c.WillWrite && c.AfterBytes == 0),
+            "B 方案预览含「移除 A 套遗留 AGENTS.md」（WillWrite=true / AfterBytes=0）");
+
+        // 3 A → B
+        var bApply = sb.Adapter.Apply(new ApplyOptions(), null, ct);
+        r.Check(bApply.Applied, "A→B apply 报告已写入");
+        var patchB = FileText.Read(sb.PatchPath);
+        r.Check(patchB.Contains("INJECTED REVISION ACTION", StringComparison.Ordinal), "B 套：受管段里是 gpt-instruct 原文");
+        r.Check(!patchB.Contains("personaSuffix:", StringComparison.Ordinal), "B 套：personaSuffix 不写（空槽）");
+        r.Check(!File.Exists(agents), "B 套：A 套遗留的 AGENTS.md 被移除");
+        r.Check(bApply.Changes.Any(c => c.Layer == LayerKind.ContextPayload && c.WillWrite && c.AfterBytes == 0),
+            "B 套：移除遗留也走 PlannedChange（WillWrite=true / AfterBytes=0）");
+        var bAgain = sb.Adapter.Apply(new ApplyOptions(), null, ct);
+        r.Check(!bAgain.Changes.Any(c => c.WillWrite) && !bAgain.Applied, "B 方案连续两次 apply：无字节变化、WillWrite 全 false");
+
+        // 4 B → A
+        sb.Adapter.Ctx.Schemes().Write(InjectionScheme.Own);
+        var backA = sb.Adapter.Apply(new ApplyOptions(), null, ct);
+        r.Check(backA.Applied, "B→A apply 报告已写入");
+        var patchA = FileText.Read(sb.PatchPath);
+        r.Check(!patchA.Contains("INJECTED REVISION ACTION", StringComparison.Ordinal), "切回 A：受管段不再含 B 套原文");
+        r.Check(patchA.Contains("personaSuffix:", StringComparison.Ordinal), "切回 A：personaSuffix 恢复");
+        var ownPayload = sb.Adapter.Ctx.TextFor("payload", InjectionScheme.Own);
+        r.Check(File.Exists(agents) && FileText.Read(agents) == ownPayload, "切回 A：AGENTS.md 恢复为 A 套载荷");
+
+        // 5 从 B 方案 revert 回出厂态
+        sb.Adapter.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        sb.Adapter.Apply(new ApplyOptions(), null, ct);
+        var rev = sb.Adapter.Revert(new RevertOptions(), null, ct);
+        r.Check(rev.Reverted, "从 B 方案 revert 报告已还原");
+        r.Check(FileText.Read(sb.PatchPath) == FactoryPatch, "revert 后补丁层逐字节等于出厂内容");
+        r.Check(!FileText.Exists(agents), "revert 后 AGENTS.md 不存在（出厂态）");
+        r.Check(rev.ReadBackClean && rev.MatchesOriginal == true,
+            $"revert 回读干净且与首次备份一致（ReadBackClean={rev.ReadBackClean} / MatchesOriginal={rev.MatchesOriginal}）");
+
+        // 6 非法 scheme 值 → own + Note
+        DualScheme.InvalidValueFallsBackToOwn(r, sb.Adapter.Ctx, "dsh");
+        FileText.Write(sb.Adapter.Ctx.Policy.SchemePath, "bogus-value\n");
+        var st = sb.Adapter.GetStatus(ct);
+        r.Check(st.Notes.Any(n => n.Title == "方案文件"), "状态页 Notes 说明方案文件非法（按 own 处理）");
+
+        // 7 fail-closed：B 套资源缺失
+        var broken = Setup(ctx, asar, FactoryPatch);
+        var brokenTarget = new DshTarget(DualScheme.BreakProtocolCarrier(broken.Adapter.Ctx, "prefix"));
+        brokenTarget.SavePolicyFile("scheme", "protocol", ct);
+        var shaBefore = FileText.Sha256File(broken.PatchPath);
+        var threw = false;
+        try { brokenTarget.Apply(new ApplyOptions(), null, ct); }
+        catch (AgentEngineException ex)
+        {
+            threw = true;
+            r.Check(ex.Code is EngineErrorCode.TargetFileMissing or EngineErrorCode.SelfCheckFailed,
+                $"B 套资源缺失 → apply 抛 {ex.Code}");
+        }
+        r.Check(threw, "B 套资源缺失时 fail-closed（不是静默注空文本）");
+        r.Check(FileText.Sha256File(broken.PatchPath) == shaBefore, "fail-closed 时补丁层一个字节都没写");
+
+        // 8 标记：B 方案用 B 套标记集
+        r.Check(DshMarkers.SpecsForScheme(InjectionScheme.Protocol)
+                .Any(s => s.Marker == "INJECTED REVISION ACTION" && s.Layer == MarkerLayer.SystemPrompt),
+            "CheckMarkers 在 protocol 方案用 B 套系统层标记集");
+        r.Check(DshMarkers.SpecsForScheme(InjectionScheme.Own).All(s => s.Marker != "INJECTED REVISION ACTION"),
+            "own 方案仍用原标记集（未被替换）");
+
+        // 9 状态 Notes 报当前方案
+        var sb2 = Setup(ctx, asar, FactoryPatch);
+        sb2.Adapter.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        sb2.Adapter.Apply(new ApplyOptions(), null, ct);
+        DualScheme.PropagatesToStatusNotes(r, sb2.Adapter.GetStatus(ct), "dsh");
+
+        // 9b 端到端命中判据：同一份会话，标记集必须跟着方案走（否则 B 方案下命中恒为 0 = 假结论）
+        var sb3 = Setup(ctx, asar, FactoryPatch);
+        WriteSession(sb3.Home, "--D-ws--", "session-proto01",
+            """{"type":"session","version":4,"id":"session-proto01"}""",
+            """{"type":"system/message","seq":2,"data":{"message":{"role":"system","content":[{"type":"text","text":"INJECTED REVISION ACTION\n\nOUTPUT_CONTRACT and VERIFIED TRANSACTION"}]}}}""");
+        sb3.Adapter.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        var hitB = sb3.Adapter.CheckMarkers("session-proto01", ct);
+        var hitBTotal = hitB.Hits.Sum(h => h.Count);
+        r.Check(hitBTotal > 0, $"B 方案下 CheckMarkers 命中 {hitBTotal} 次（B 套标记集端到端生效）");
+        r.Check(hitB.Hits.Where(h => h.Layer == MarkerLayer.SystemPrompt).Sum(h => h.Count) > 0,
+            "命中的落在系统层（B 套标记的分层与声明一致）");
+        sb3.Adapter.Ctx.Schemes().Write(InjectionScheme.Own);
+        var hitA = sb3.Adapter.CheckMarkers("session-proto01", ct);
+        r.Check(hitA.Hits.Sum(h => h.Count) == 0,
+            $"同一份会话在 own 方案下命中 {hitA.Hits.Sum(h => h.Count)} 次（标记集随方案切换，不是恒定命中）");
     }
 
     // ---------------------------------------------------------------- 沙箱

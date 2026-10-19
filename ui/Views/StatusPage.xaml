@@ -21,6 +21,12 @@
                         <TextBlock Grid.Row="2" Grid.ColumnSpan="2" Text="{Binding CheckedAt}" Style="{StaticResource MutedTextStyle}" />
                     </Grid>
                 </Border>
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="注入方案" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                        <TextBlock Text="{Binding Scheme}" TextWrapping="Wrap" />
+                    </StackPanel>
+                </Border>
                 <InfoBar IsOpen="{Binding RestartRequired}" IsClosable="False" Severity="Warning" Title="改动需重启" Message="请完全退出客户端及托盘进程，再启动客户端以验证新会话。" />
                 <ItemsControl ItemsSource="{Binding Layers}">
                     <ItemsControl.ItemTemplate>

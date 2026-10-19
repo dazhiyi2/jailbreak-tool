@@ -16,6 +16,8 @@ public sealed class SupportSelfTest : ITargetSelfTest
     {
         var r = new SelfTestResult { Name = Name };
         var sandbox = ctx.MakeSandbox("support");
+        // 真实客户端的只读快照（全部 7 个路径）：自检结束时变化项必须为 0。
+        var realSnapshot = DualScheme.CaptureReal("support");
 
         // ---- 1. 纯文本纪律：原子写 + sha256 + UTF-8 无 BOM ----
         r.Step("文本与哈希");
@@ -108,6 +110,29 @@ public sealed class SupportSelfTest : ITargetSelfTest
         r.Check(reg.Count > 0, $"注册表卸载项里认出 ZCode 候选 {reg.Count} 个");
         r.Step("  候选：" + string.Join(" | ", reg.Take(3)));
 
+        // ---- 7. 方案选择器（scheme.txt）：缺省 own、规范化写入、非法值退回 own、B 套原文 verbatim ----
+        r.Step("方案选择器与 B 套原文");
+        var schemeDir = Path.Combine(sandbox, "policy");
+        Directory.CreateDirectory(schemeDir);
+        var store = new SchemeStore(schemeDir);
+        r.Check(!File.Exists(store.Path), "scheme.txt 不存在");
+        r.Check(store.Read(out var note0) == InjectionScheme.Own && note0 is null, "scheme.txt 不存在 → own（无告警）");
+        store.Write(InjectionScheme.Protocol);
+        r.Check(FileText.Read(store.Path) == "protocol", "写入后落盘内容是规范化值 protocol");
+        r.Check(store.Read() == InjectionScheme.Protocol, "回读 = protocol");
+        FileText.Write(store.Path, "  PROTOCOL  \n");
+        r.Check(store.Read() == InjectionScheme.Protocol, "大小写与首尾空白不敏感");
+        FileText.Write(store.Path, "not-a-scheme");
+        r.Check(store.Read(out var note1) == InjectionScheme.Own && note1 is not null,
+            $"非法值 → 按 own 并留 Note（「{note1}」）");
+        FileText.Write(store.Path, "   ");
+        r.Check(store.Read() == InjectionScheme.Own, "空白内容 → own");
+        r.Check(SchemeText.TryParse("own", out var parsedOwn) && parsedOwn == InjectionScheme.Own &&
+                SchemeText.TryParse("protocol", out var parsedProto) && parsedProto == InjectionScheme.Protocol &&
+                !SchemeText.TryParse("PROTO", out _), "SchemeText.TryParse 只认 own / protocol");
+        DualScheme.Verbatim(r, "support");
+
+        DualScheme.CheckRealReadOnly(r, "support", realSnapshot);
         return r;
     }
 }

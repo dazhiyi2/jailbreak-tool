@@ -34,10 +34,12 @@ bool HasFlag(string name)
 var json = HasFlag("--json");
 var target = TakeFlag("--target");
 var root = TakeFlag("--root");
+// 本工具自己的数据根（policy\ / ledger）。默认 %LOCALAPPDATA%\AgentToolkit；自检与演练用 --data-root 指到沙箱。
+var dataRoot = TakeFlag("--data-root");
 var cmd = rest.Count > 0 ? rest[0] : "status";
 if (rest.Count > 0) rest.RemoveAt(0);
 
-var engine = new MultiTargetEngine();
+var engine = new MultiTargetEngine(dataRoot);
 if (!string.IsNullOrWhiteSpace(target)) await engine.SelectTargetAsync(target!);
 
 void Emit(object o, Action human)
@@ -195,11 +197,28 @@ try
         }
         case "policy":
         {
+            // 切换方案：engine --target <id> policy save scheme <文件>   （文件内容 own / protocol）
+            if (rest.Count > 0 && string.Equals(rest[0], "save", StringComparison.OrdinalIgnoreCase))
+            {
+                var name = rest.ElementAtOrDefault(1) ?? throw new ArgumentException("policy save 需要 <name> <file>");
+                var file = rest.ElementAtOrDefault(2) ?? throw new ArgumentException("policy save 需要 <name> <file>");
+                if (!File.Exists(file)) throw new ArgumentException($"文件不存在：{file}");
+                var info = await engine.SavePolicyFileAsync(name, File.ReadAllText(file));
+                Console.WriteLine($"已保存 {info.Name} → {info.Path} ({FileSize(info.SizeBytes)})");
+                foreach (var n in info.Notes) Console.WriteLine($"  ! {n.Title}: {n.Detail}");
+                break;
+            }
+
             var list = await engine.GetPolicyFilesAsync();
             Emit(list, () =>
             {
                 foreach (var p in list)
-                    Console.WriteLine($"{p.Name,-8} {FileSize(p.SizeBytes),10} / {(p.CapBytes is long c ? FileSize(c) : "无上限"),-10} {(p.Editable ? "可编辑" : "只读")}  {p.Path}");
+                    Console.WriteLine($"{p.Name,-14} {FileSize(p.SizeBytes),10} / {(p.CapBytes is long c ? FileSize(c) : "无上限"),-10} {(p.Editable ? "可编辑" : "只读")}  {p.DisplayName}");
+                var scheme = list.FirstOrDefault(p => string.Equals(p.Name, "scheme", StringComparison.OrdinalIgnoreCase));
+                Console.WriteLine($"\n当前注入方案：{scheme?.Text ?? "(未提供)"}");
+                foreach (var p in list)
+                    foreach (var n in p.Notes.Where(n => n.Severity != Severity.Info || n.Title is "注入方案" or "该方案下此槽位不注入"))
+                        Console.WriteLine($"  ! [{p.Name}] {n.Title}: {n.Detail}");
             });
             break;
         }
@@ -307,11 +326,10 @@ try
         }
         default:
             Console.Error.WriteLine("""
-                用法: engine <command> [--target dsh|zcode] [--json]
-                  targets | select <id> | locate [--root <dir>] [--sniff]
-                  status | preview [--force] | apply [--dry-run] [--force] [--restart] | revert [--dry-run] [--remove-backups] [--restart]
+                用法: engine <command> [--target dsh|zcode] [--json] [--data-root <dir>]
+                  targets | select <id> | locate [--root <dir>] [--sniff]                  status | preview [--force] | apply [--dry-run] [--force] [--restart] | revert [--dry-run] [--remove-backups] [--restart]
                   sessions | session <id|latest> | check <id|latest> | diff [<id>]
-                  policy | set-policy <name> <file> | export-session <id> [out] | export-system <id> [out]
+                  policy | policy save <name> <file> | set-policy <name> <file> | export-session <id> [out] | export-system <id> [out]
                   judge <id|latest>            # 读推理原文 + 讨论信号普查 + 判读建议
                   probes | verdict <probeId> <level> <excerptFile>
                 """);

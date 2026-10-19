@@ -53,6 +53,26 @@ public sealed class MockEngine : IAgentEngine
                 Editable = name != "suffix" || s != MockScenario.AnchorAmbiguous,
                 Notes = new[] { SimulationNote() },
             };
+        // 方案选择器（保留名 scheme）：只读、两个合法值；演示引擎不碰真实文件。
+        _policies["scheme"] = new PolicyFileInfo
+        {
+            Name = "scheme",
+            DisplayName = "注入方案（own=本工具 / protocol=gpt-instruct）",
+            Text = "own",
+            Path = $@"{Home}\policy\scheme.txt",
+            SizeBytes = 3,
+            Editable = false,
+            Notes = new[]
+            {
+                SimulationNote(),
+                new Note
+                {
+                    Title = "注入方案",
+                    Detail = "当前 own（本工具方案，现有注入文本一个字未改）；该方案下不注入的槽位：（无）。",
+                    Source = "界面演示",
+                },
+            },
+        };
         if (s != MockScenario.StockClean && s != MockScenario.NotLocated)
             _verdicts.Add(new ProbeVerdict
             {
@@ -159,7 +179,18 @@ public sealed class MockEngine : IAgentEngine
             RestartRequired = _restartRequired ?? (_scenario is MockScenario.UpgradeOverwritten or MockScenario.BackupContaminated),
             Layers = new[] { Layer(LayerKind.SystemPrompt), Layer(LayerKind.ContextPayload) },
             LastMarkerReport = HasSessions ? Markers("demo-session-001") : null,
-            Notes = Target().Notes, CheckedAt = DateTimeOffset.Now,
+            Notes = Target().Notes.Concat(new[]
+            {
+                new Note
+                {
+                    Title = "注入方案",
+                    Detail = _policies.TryGetValue("scheme", out var scheme) && scheme.Text == "protocol"
+                        ? "当前 protocol（gpt-instruct 原文，逐字节不动）；载体槽随目标不同；空槽不注入。"
+                        : "当前 own（本工具方案，现有注入文本一个字未改）；所有槽位都注入。",
+                    Source = "界面演示",
+                },
+            }).ToArray(),
+            CheckedAt = DateTimeOffset.Now,
         };
     }
 
@@ -399,6 +430,19 @@ public sealed class MockEngine : IAgentEngine
     {
         await PauseAsync(ct);
         if (!_policies.TryGetValue(name, out var file)) throw new AgentEngineException(EngineErrorCode.TargetFileMissing, "模拟文本不存在。");
+        if (string.Equals(name, "scheme", StringComparison.OrdinalIgnoreCase))
+        {
+            var value = (text ?? "").Trim().ToLowerInvariant();
+            if (value is not ("own" or "protocol"))
+                throw new AgentEngineException(EngineErrorCode.VerifyProblems, "模拟方案只接受 own / protocol。");
+            file.Text = value;
+            file.SizeBytes = Encoding.UTF8.GetByteCount(value);
+            file.Notes = file.Notes.Concat(new[]
+            {
+                Diagnostic("注入方案已切换", value == "protocol" ? "protocol（gpt-instruct 原文）" : "own（本工具方案）"),
+            }).ToArray();
+            return ClonePolicy(file);
+        }
         if (!file.Editable) throw new AgentEngineException(EngineErrorCode.Unsupported, "当前模拟文本只读。");
         var bytes = Encoding.UTF8.GetByteCount(text);
         if (file.CapBytes is long cap && bytes > cap) throw new AgentEngineException(EngineErrorCode.VerifyProblems, "模拟文本超过上限。", new[] { Diagnostic("超出体积上限", $"当前 {bytes} 字节，上限 {cap} 字节。", Severity.Error) });

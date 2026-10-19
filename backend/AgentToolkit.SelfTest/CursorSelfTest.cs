@@ -67,6 +67,7 @@ public sealed class CursorSelfTest : ITargetSelfTest
 
         var installBefore = SnapshotTree(realInstall);
         var configBefore = SnapshotTree(realConfig, skipWalIndexShm: true);
+        var realSnapshot = DualScheme.CaptureReal("cursor");
         var shmBefore = WalIndexShmCount(realConfig);
         r.Step($"    快照：安装根 {installBefore.Count} 个文件、配置根 {configBefore.Count} 个文件" +
                $"（另有 {shmBefore} 个 *.db-shm 不参与比对）");
@@ -85,6 +86,7 @@ public sealed class CursorSelfTest : ITargetSelfTest
             Case10Effectiveness(ctx, r, SetEnv);
             Case11Logs(ctx, r, SetEnv);
             Case12LocateDiffExportProbes(ctx, r, SetEnv);
+            Case16DualScheme(ctx, r, SetEnv);
         }
         finally
         {
@@ -92,6 +94,7 @@ public sealed class CursorSelfTest : ITargetSelfTest
         }
 
         Case13RealDataReadOnly(ctx, r, realInstall, realConfig);
+        DualScheme.CheckRealReadOnly(r, "cursor", realSnapshot);
 
         // 收尾：真实安装根与配置根必须一个字节都没变（自检全程只读它们）。
         var installAfter = SnapshotTree(realInstall);
@@ -895,8 +898,8 @@ public sealed class CursorSelfTest : ITargetSelfTest
             "E 的判据指向 rules 档 characterCount（本目标的定量判据）");
 
         // ---- 注入文本 ----
-        var policy = s.Target.GetPolicyFiles(default);
-        r.Check(policy.Count == 2, $"注入文本两条：payload + personal（实际 {policy.Count}）");
+        var policy = s.Target.GetPolicyFiles(default).Where(p => p.Name != "scheme").ToArray();
+        r.Check(policy.Length == 2, $"注入文本两条：payload + personal（实际 {policy.Length}）");
         r.Check(policy.All(p => p.Text.Length > 0), "两条注入文本都物化到磁盘且非空");
         r.Check(policy.First(p => p.Name == "payload").Path.EndsWith("cursor.payload.md", StringComparison.Ordinal),
             "payload 落在 cursor.payload.md");
@@ -1087,7 +1090,8 @@ public sealed class CursorSelfTest : ITargetSelfTest
                 "真实最近会话里没有本工具的标记（命中 0）：本机从未注入过");
             r.Check(st.LastMarkerReport?.Verdict.Contains("先看定量判据", StringComparison.Ordinal) == true,
                 "真实客户端上命中 0 也如实说明「不等于没生效」");
-            r.Check(realTarget.GetPolicyFiles(default).Count == 2, "真实客户端上两条注入文本可读（沙箱数据目录）");
+            r.Check(realTarget.GetPolicyFiles(default).Count(p => p.Name != "scheme") == 2,
+                "真实客户端上两条注入文本可读（沙箱数据目录）");
             ctx.Log($"real GetStatus: {st.Layers[0].State}/{st.Layers[1].State}/{st.Layers[2].State}");
         }
 
@@ -1236,6 +1240,108 @@ public sealed class CursorSelfTest : ITargetSelfTest
             PayloadBody = payloadBody,
             RenderedRules = rendered,
         };
+    }
+
+    // ================================================================ 16 双注入方案
+
+    /// <summary>
+    /// own / protocol 双方案：载体槽 = personal（state.vscdb 的个人规则层）；
+    /// 空槽 = payload（&lt;工作区&gt;\.cursor\rules\breach.mdc）。补丁层与方案无关，照打。
+    /// </summary>
+    private static void Case16DualScheme(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【16】双注入方案（own / protocol）：载体槽 personal、空槽 payload、双向切换、幂等、revert、verbatim、fail-closed、标记");
+        DualScheme.Verbatim(r, "cursor");
+
+        var sb = Setup(ctx, setEnv, "scheme");
+
+        // 1 缺省 = own（回归）
+        DualScheme.SelectorMissingIsOwn(r, sb.Target.Ctx, "cursor");
+        var ownApply = sb.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(ownApply.Applied, "own 方案 apply 写入（回归）");
+        var patchShaAfterA = sb.PatchFiles.Select(FileText.Sha256File).ToArray();
+        var snapA = CursorDb.Snapshot(sb.DbPath, CursorDb.PersonalContextKey);
+        r.Check(snapA.KeyPresent && snapA.KeyValue == sb.PersonalText, "own 方案照旧把 A 套个人规则写进 state.vscdb");
+        r.Check(FileText.Exists(sb.RulesPath), "own 方案照旧写项目规则 .cursor\\rules\\breach.mdc");
+        var ownAgain = sb.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(!ownAgain.Changes.Any(c => c.WillWrite), "own 方案连续两次 apply：WillWrite 全 false");
+
+        // 2 切 protocol
+        DualScheme.SwitchToProtocol(r, sb.Target.Ctx, "cursor", "personal");
+        r.Check(sb.Target.Ctx.EmptySlotNames(InjectionScheme.Protocol).Contains("payload"), "protocol 的空槽含 payload");
+
+        // 3 A → B
+        var bApply = sb.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(bApply.Applied, "A→B apply 报告已写入");
+        var snapB = CursorDb.Snapshot(sb.DbPath, CursorDb.PersonalContextKey);
+        r.Check(snapB.KeyPresent && snapB.KeyValue == DualScheme.EmbeddedProtocol(),
+            "B 套：state.vscdb 的个人规则值逐字节等于 gpt-instruct 原文");
+        r.Check((snapB.KeyValue ?? "").Length == DualScheme.ProtocolBytes - 1 || FileText.Bytes(snapB.KeyValue ?? "") == DualScheme.ProtocolBytes,
+            $"B 套：个人规则值 {FileText.Bytes(snapB.KeyValue ?? "")} 字节");
+        r.Check(!File.Exists(sb.RulesPath), "B 套：A 套遗留的 .cursor\\rules\\breach.mdc 被移除");
+        r.Check(bApply.Changes.Any(c => c.Path == sb.RulesPath && c.WillWrite && c.AfterBytes == 0),
+            "B 套：.mdc 移除走 PlannedChange（WillWrite=true / AfterBytes=0）");
+        r.Check(!bApply.Changes.Any(c => c.Path == sb.RulesPath && c.WillWrite && c.AfterBytes > 0),
+            "B 套：空槽没有产生写入型计划变更");
+        r.Check(sb.PatchFiles.Select(FileText.Sha256File).SequenceEqual(patchShaAfterA), "B 套：补丁层与方案无关，字节不变（幂等）");
+        r.Check(File.Exists(Path.Combine(CursorRules.DirFor(sb.Workspace), "someone-else.mdc")), "B 套：别人的 .mdc 没被动过");
+        var bAgain = sb.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(!bAgain.Changes.Any(c => c.WillWrite) && !bAgain.Applied, "B 方案连续两次 apply：无字节变化、WillWrite 全 false");
+
+        // 4 B → A
+        sb.Target.Ctx.Schemes().Write(InjectionScheme.Own);
+        var backA = sb.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(backA.Applied, "B→A apply 报告已写入");
+        var snapA2 = CursorDb.Snapshot(sb.DbPath, CursorDb.PersonalContextKey);
+        r.Check(snapA2.KeyPresent && snapA2.KeyValue == sb.PersonalText, "切回 A：个人规则恢复为 A 套文本");
+        r.Check(FileText.Read(sb.RulesPath) == sb.RenderedRules, "切回 A：项目规则 .mdc 恢复为 A 套渲染结果");
+
+        // 5 从 B 方案 revert 回出厂态
+        sb.Target.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        sb.Target.Apply(new ApplyOptions(), null, default);
+        var rev = sb.Target.Revert(new RevertOptions(), null, default);
+        r.Check(rev.Reverted, "从 B 方案 revert 报告已还原");
+        var snapFactory = CursorDb.Snapshot(sb.DbPath, CursorDb.PersonalContextKey);
+        r.Check(!snapFactory.KeyPresent, "revert 后 aicontext.personalContext 键不存在（出厂态）");
+        r.Check(!File.Exists(sb.RulesPath), "revert 后 .cursor\\rules\\breach.mdc 不存在（出厂态）");
+        r.Check(rev.ReadBackClean, "revert 回读干净");
+        r.Check(rev.MatchesOriginal == true, $"与首次备份 sha256 比对一致（MatchesOriginal={rev.MatchesOriginal}）");
+
+        // 6 非法 scheme 值 → own + Note
+        DualScheme.InvalidValueFallsBackToOwn(r, sb.Target.Ctx, "cursor");
+        FileText.Write(sb.Target.Ctx.Policy.SchemePath, "bogus-value\n");
+        var st = sb.Target.GetStatus(default);
+        r.Check(st.Notes.Any(n => n.Title == "方案文件"), "状态页 Notes 说明方案文件非法（按 own 处理）");
+
+        // 7 fail-closed：B 套载体资源缺失 → 个人规则文本为空 → 拒绝写入
+        sb.Target.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        var broken = new CursorTarget(DualScheme.BreakProtocolCarrier(sb.Target.Ctx, "personal"));
+        var dbSha = FileText.Sha256File(sb.DbPath);
+        var patchSha = sb.PatchFiles.Select(FileText.Sha256File).ToArray();
+        var threw = false;
+        try { broken.Apply(new ApplyOptions(), null, default); }
+        catch (AgentEngineException ex)
+        {
+            threw = true;
+            r.Check(ex.Code is EngineErrorCode.SelfCheckFailed or EngineErrorCode.TargetFileMissing or EngineErrorCode.VerifyProblems,
+                $"B 套资源缺失 → apply 抛 {ex.Code}");
+        }
+        r.Check(threw, "B 套资源缺失时 fail-closed（不是静默注空文本）");
+        r.Check(FileText.Sha256File(sb.DbPath) == dbSha, "fail-closed 时 state.vscdb 一个字节都没写");
+        r.Check(sb.PatchFiles.Select(FileText.Sha256File).SequenceEqual(patchSha), "fail-closed 时补丁层也没动");
+
+        // 8 标记：B 方案用 B 套载荷层标记
+        r.Check(CursorMarkers.SpecsForScheme(InjectionScheme.Protocol)
+                .Any(s => s.Marker == "INJECTED REVISION ACTION" && s.Layer == MarkerLayer.ContextPayload),
+            "CheckMarkers 在 protocol 方案用 B 套载荷层标记集");
+        r.Check(CursorMarkers.SpecsForScheme(InjectionScheme.Own).All(s => s.Marker != "INJECTED REVISION ACTION"),
+            "own 方案仍用原标记集（未被替换）");
+
+        // 9 状态 Notes 报当前方案
+        var target2 = new CursorTarget(sb.Target.Ctx);
+        target2.Apply(new ApplyOptions(), null, default);
+        DualScheme.PropagatesToStatusNotes(r, target2.GetStatus(default), "cursor");
     }
 
     /// <summary>

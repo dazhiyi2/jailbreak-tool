@@ -57,6 +57,7 @@ public sealed class AntigravityTarget : ITargetAdapter
     /// </summary>
     public static IReadOnlyList<PolicyTextDef> PolicyDefs { get; } = new[]
     {
+        // ---- A 套（own）：现有注入文本，一个字未改 ----
         new PolicyTextDef
         {
             Name = "rules",
@@ -73,7 +74,38 @@ public sealed class AntigravityTarget : ITargetAdapter
             ResourceSuffix = "opencode.payload.md",
             CapBytes = AntigravityRules.PerFileCapBytes,
         },
+
+        // ---- B 套（protocol）：载体槽 = rules，放 gpt-instruct 原文（逐字节）；payload 是空槽 ----
+        new PolicyTextDef
+        {
+            Name = "rules",
+            DisplayName = "规则层（rules\\AGENTS.md）· gpt-instruct 原文",
+            FileName = "antigravity.rules.schemeB.md",
+            ResourceSuffix = SchemeBProtocolSuffix,
+            CapBytes = AntigravityRules.PerFileCapBytes,
+            Scheme = InjectionScheme.Protocol,
+        },
+        new PolicyTextDef
+        {
+            Name = "payload",
+            DisplayName = "规则层第二份（protocol 方案下为空槽：不注入）",
+            FileName = "antigravity.extra.schemeB.md",
+            ResourceSuffix = SchemeBEmptySuffix,
+            Required = false,
+            Editable = false,
+            Scheme = InjectionScheme.Protocol,
+        },
     };
+
+    private const string SchemeBProtocolSuffix = "schemeB.protocol.md";
+    private const string SchemeBEmptySuffix = "schemeB.empty.md";
+
+    private Note SchemeNote(InjectionScheme scheme) => Notes.Info("注入方案",
+        scheme == InjectionScheme.Protocol
+            ? "当前 protocol（gpt-instruct 原文，逐字节不动）；载体槽 = rules（rules\\AGENTS.md）；" +
+              "空槽 = payload（rules\\JailbreakTool.md 不注入；A 套遗留的会被 apply 移除）。"
+            : "当前 own（本工具方案）；规则层 = rules\\AGENTS.md + rules\\JailbreakTool.md。",
+        Ctx.Policy.SchemePath);
 
     // ================================================================ 定位 / 描述
 
@@ -155,6 +187,10 @@ public sealed class AntigravityTarget : ITargetAdapter
         var loc = Peek(ct);
         var notes = new List<Note>(loc.Notes.Where(n => n.Severity != Severity.Info));
 
+        var scheme = Ctx.ActiveScheme(out var schemeNote);
+        if (schemeNote is not null) notes.Add(Notes.Warn("方案文件", schemeNote, Ctx.Policy.SchemePath));
+        notes.Add(SchemeNote(scheme));
+
         var sessions = new List<SessionInfo>();
         try { sessions = ListSessions(ct).ToList(); }
         catch (Exception ex) { notes.Add(Notes.Warn("会话列表读不了", ex.Message, loc.ConversationsDir)); }
@@ -176,15 +212,17 @@ public sealed class AntigravityTarget : ITargetAdapter
                 loc.ConversationsDir));
         }
 
-        var rulesLayer = RulesLayerStatus(loc);
+        var rulesLayer = RulesLayerStatus(loc, scheme);
         var skillLayer = SkillLayerStatus(loc);
         var permissionLayer = PermissionLayerStatus(loc);
 
+        var rulesMarkers = SchemeMarkers.ForLayer(scheme, AntigravityMarkers.RulesMarkers);
+        var payloadMarkers = SchemeMarkers.ForLayer(scheme, AntigravityMarkers.PayloadMarkers);
         var sessionHits = extract is null
             ? (int?)null
-            : AntigravityMarkers.CountHits(extract.Text, AntigravityMarkers.RulesMarkers.Concat(AntigravityMarkers.PayloadMarkers).ToArray());
+            : AntigravityMarkers.CountHits(extract.Text, rulesMarkers.Concat(payloadMarkers).ToArray());
 
-        ApplyEffectiveness(rulesLayer, "规则层", AntigravityMarkers.RulesMarkers.ToArray(), sessionHits, newestId,
+        ApplyEffectiveness(rulesLayer, "规则层", rulesMarkers.ToArray(), sessionHits, newestId,
             rulesLayer.State == LayerState.Applied, notes);
         ApplyEffectiveness(permissionLayer, "权限层", Array.Empty<string>(), sessionHits, newestId,
             permissionLayer.State == LayerState.Applied, notes);
@@ -231,34 +269,42 @@ public sealed class AntigravityTarget : ITargetAdapter
     }
 
     /// <summary>层 1：规则层（rules/AGENTS.md）。判据 = 文件在盘上且含本工具的注入标记。</summary>
-    private LayerStatus RulesLayerStatus(AntigravityLocation loc)
+    private LayerStatus RulesLayerStatus(AntigravityLocation loc, InjectionScheme scheme)
     {
         var layer = StatusBuilder.BuildLayer(
             LayerKind.PolicyText,
             "规则层（~/.gemini/config/rules/AGENTS.md）",
             loc.AgentsPath,
             AntigravityRules.PerFileCapBytes,
-            // 判据与污染判据都用同一组「自家注入标记」（规则 + 载荷）：
+            // 判据与污染判据都用同一组「自家注入标记」（规则 + 载荷，protocol 方案换成 B 套标记）：
             // 备份里出现任一条就说明它不是原始文件，用两套标记会把污染漏报成干净。
-            AntigravityMarkers.BackupMarkers,
+            SchemeMarkers.ForLayer(scheme, AntigravityMarkers.BackupMarkers),
             parseOk: null,
             absentDetail: $"rules\\AGENTS.md 不存在：首次 apply 会创建它（{loc.AgentsPath}）。" +
                           "Antigravity 从工作目录向上逐级加载 GEMINI.md / AGENTS.md，rules/ 也在活动规则集里。",
-            appliedDetail: "rules\\AGENTS.md 存在且含本工具的注入标记（会话启动时装配）。",
-            notAppliedDetail: "rules\\AGENTS.md 存在，但内容不是本工具的规则（用户自己的文件，apply 会先备份）。");
+            appliedDetail: "rules\\AGENTS.md 存在且含当前方案的注入标记（会话启动时装配）。",
+            notAppliedDetail: "rules\\AGENTS.md 存在，但内容不是本工具当前方案的规则（用户自己的文件，apply 会先备份）。");
 
         RefreshBackup(layer, loc.AgentsPath);
 
         var extra = new List<Note>();
         var extraText = FileText.ReadOrNull(loc.ExtraPath);
+        var extraEmptySlot = Ctx.IsEmptySlot("payload", Ctx.ActiveScheme());
         extra.Add(Notes.Info("第二份规则",
-            extraText is null
-                ? $"rules\\{AntigravityRules.ExtraFileName} 不存在：apply 会一并写入（载荷文本）。"
-                : $"rules\\{AntigravityRules.ExtraFileName} 在盘上（{FileText.Human(FileText.Bytes(extraText))}）" +
-                  (AntigravityRules.IsOurs(extraText) ? "，是本工具写的。" : "，不是本工具写的。"),
+            extraEmptySlot
+                ? $"protocol 方案下 rules\\{AntigravityRules.ExtraFileName} 是空槽（不注入）；" +
+                  (extraText is null
+                      ? "盘上本来没有这个文件。"
+                      : AntigravityRules.IsOurs(extraText)
+                          ? "盘上这份是本工具写的，apply 会移除它。"
+                          : "盘上这份不是本工具写的，一律不动。")
+                : extraText is null
+                    ? $"rules\\{AntigravityRules.ExtraFileName} 不存在：apply 会一并写入（载荷文本）。"
+                    : $"rules\\{AntigravityRules.ExtraFileName} 在盘上（{FileText.Human(FileText.Bytes(extraText))}）" +
+                      (AntigravityRules.IsOurs(extraText) ? "，是本工具写的。" : "，不是本工具写的。"),
             loc.ExtraPath));
 
-        var rulesText = SafePolicyText("rules");
+        var rulesText = SafePolicyText("rules", Ctx.ActiveScheme());
         extra.Add(Notes.Info("单文件上限",
             $"注入文本 {FileText.Human(FileText.Bytes(rulesText))}（上限 {FileText.Human(AntigravityRules.PerFileCapBytes)}）：" +
             "内嵌文档写明单个规则文件 24,000 字节、超出按行边界截断，全局规则另有 20,000 token 预算——超预算会从内联全文降级成路径指针。",
@@ -266,6 +312,10 @@ public sealed class AntigravityTarget : ITargetAdapter
         extra.Add(Notes.Info("加载顺序",
             "rules/ 之外，任意目录的 GEMINI.md / AGENTS.md 会从工作目录**向上走到仓库根**逐级加载；" +
             "标准 GEMINI.md / AGENTS.md 不支持 frontmatter，对其目录范围始终生效（内嵌文档原文）。", loc.RulesDir));
+        extra.Add(Notes.Info("注入方案",
+            scheme == InjectionScheme.Protocol
+                ? "protocol 方案：本层是载体槽，写入的是 gpt-instruct 原文（逐字节）；第二份规则是空槽（不注入）。"
+                : "own 方案：本层写入的是本工具的规则文本，第二份规则一并注入。", loc.AgentsPath));
         layer.Notes = layer.Notes.Concat(extra).ToArray();
         return layer;
     }
@@ -470,20 +520,31 @@ public sealed class AntigravityTarget : ITargetAdapter
         public bool RulesLayer { get; init; } = true;
         public bool ExtraLayer { get; init; } = true;
         public bool PermissionLayer { get; init; } = true;
+        /// <summary>空槽清理计划（protocol 方案下 payload 为空槽时，移除 A 套遗留的 rules\JailbreakTool.md）。</summary>
+        public SlotRemovalPlan? ExtraRemoval { get; init; }
         public string PreviewId { get; init; } = "";
 
         public bool AgentsWillWrite => RulesLayer && Agents.WillWrite && Problems.Count == 0;
         public bool ExtraWillWrite => ExtraLayer && Extra.WillWrite && Problems.Count == 0;
         public bool ConfigWillWrite => PermissionLayer && Config.WillWrite && Problems.Count == 0;
-        public bool AnyWrite => AgentsWillWrite || ExtraWillWrite || ConfigWillWrite;
+        public bool AnyWrite => AgentsWillWrite || ExtraWillWrite || ConfigWillWrite ||
+                                (ExtraRemoval is { WillWrite: true } && Problems.Count == 0);
 
         public IReadOnlyList<PlannedChange> Changes()
         {
             var list = new List<PlannedChange>
             {
                 Change(Agents, AgentsWillWrite, LayerKind.PolicyText, "规则层"),
-                Change(Extra, ExtraWillWrite, LayerKind.PolicyText, "规则层第二份"),
             };
+            if (ExtraRemoval is not null)
+            {
+                var removal = SchemeSlotFile.Change(ExtraRemoval, LayerKind.PolicyText, "protocol 方案的 payload 空槽");
+                if (removal is not null) list.Add(removal);
+            }
+            else
+            {
+                list.Add(Change(Extra, ExtraWillWrite, LayerKind.PolicyText, "规则层第二份"));
+            }
 
             var notes = new List<Note>
             {
@@ -554,14 +615,25 @@ public sealed class AntigravityTarget : ITargetAdapter
         ct.ThrowIfCancellationRequested();
         var loc = Peek(ct);
         var problems = new List<string>();
+        var scheme = Ctx.ActiveScheme(out _);
 
-        var rulesText = SafePolicyText("rules");
+        var rulesText = SafePolicyText("rules", scheme);
+        var rulesDef = Ctx.DefFor("rules", scheme);
         if (string.IsNullOrWhiteSpace(rulesText))
-            problems.Add($"「规则层」文本为空：{Ctx.Policy.PathOf(PolicyDefs[0])}（拒绝写入空规则）。");
+            problems.Add($"「规则层」文本为空：{(rulesDef is null ? Ctx.Policy.PathOf(PolicyDefs[0]) : Ctx.Policy.PathOf(rulesDef))}（拒绝写入空规则）。");
 
-        var payloadText = ReadPolicyText(options.PayloadPath, "payload", required: !options.SkipContextPayload);
+        // 空槽（protocol 方案的 payload）：不写文件、不产生计划变更；A 套遗留的本工具文件由清理计划移除。
+        var payloadEmptySlot = !options.SkipContextPayload && Ctx.IsEmptySlot("payload", scheme);
+        var payloadText = options.SkipContextPayload
+            ? ""
+            : ReadPolicyText(options.PayloadPath, "payload", required: !payloadEmptySlot, scheme);
         var agents = AntigravityRules.Plan(loc.AgentsPath, rulesText, options.SkipSystemPrompt, out var p1);
-        var extra = AntigravityRules.Plan(loc.ExtraPath, payloadText, options.SkipContextPayload, out var p2);
+        var extra = AntigravityRules.Plan(loc.ExtraPath, payloadText, options.SkipContextPayload || payloadEmptySlot, out var p2);
+        SlotRemovalPlan? extraRemoval = null;
+        if (payloadEmptySlot)
+            extraRemoval = SchemeSlotFile.Plan(loc.ExtraPath,
+                SchemeMarkers.Union(AntigravityMarkers.BackupMarkers),
+                "protocol 方案的 payload 是空槽（目标位置不应有本工具的文件）");
         if (p1 is not null) problems.Add(p1);
         if (p2 is not null) problems.Add(p2);
 
@@ -569,7 +641,7 @@ public sealed class AntigravityTarget : ITargetAdapter
         var config = AntigravityConfig.Plan(loc.ConfigFile, origin, File.Exists(loc.ConfigFile));
         problems.AddRange(config.Problems);
 
-        var idInput = (origin ?? "") + "\n" + loc.AgentsPath + "\n" + rulesText + "\n" + loc.ExtraPath + "\n" + payloadText;
+        var idInput = (origin ?? "") + "\n" + loc.AgentsPath + "\n" + rulesText + "\n" + loc.ExtraPath + "\n" + payloadText + "\n" + scheme;
         return new Plan
         {
             Loc = loc,
@@ -578,20 +650,23 @@ public sealed class AntigravityTarget : ITargetAdapter
             Config = config,
             Problems = problems,
             RulesLayer = !options.SkipSystemPrompt,
-            ExtraLayer = !options.SkipContextPayload,
+            ExtraLayer = !options.SkipContextPayload && !payloadEmptySlot,
+            ExtraRemoval = extraRemoval,
             PreviewId = FileText.Sha256Text(idInput)[..16],
         };
     }
 
-    private string SafePolicyText(string name)
+    private string SafePolicyText(string name) => SafePolicyText(name, Ctx.ActiveScheme());
+
+    private string SafePolicyText(string name, InjectionScheme scheme)
     {
-        var def = Ctx.Def(name);
+        var def = Ctx.DefFor(name, scheme);
         if (def is null) return "";
         try { return Ctx.Policy.Read(def) ?? ""; }
         catch { return ""; }
     }
 
-    private string ReadPolicyText(string? overridePath, string defName, bool required)
+    private string ReadPolicyText(string? overridePath, string defName, bool required, InjectionScheme scheme)
     {
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
@@ -601,7 +676,7 @@ public sealed class AntigravityTarget : ITargetAdapter
             return "";
         }
 
-        var def = Ctx.Def(defName)
+        var def = Ctx.DefFor(defName, scheme)
                   ?? throw new AgentEngineException(EngineErrorCode.Unsupported, $"没有名为「{defName}」的注入文本。");
         var text = Ctx.Policy.Read(def);
         if (text is null)
@@ -719,6 +794,21 @@ public sealed class AntigravityTarget : ITargetAdapter
             notes.Add(Notes.Info("已写入", $"{what}：{filePlan.Path}（{FileText.Human(filePlan.AfterBytes)}）", filePlan.Path));
         }
 
+        // ---- 空槽清理（protocol 方案：payload 不注入，A 套遗留的 rules\JailbreakTool.md 要移除） ----
+        if (plan.ExtraRemoval is { WillWrite: true } leftover)
+        {
+            progress?.Report(new EngineProgress { Stage = "cleanup", Message = "移除另一套方案遗留的 JailbreakTool.md", Fraction = 0.7 });
+            var deleted = SchemeSlotFile.Execute(leftover);
+            wrote |= deleted;
+            notes.Add(deleted
+                ? Notes.Info("已移除遗留文件", leftover.Note, leftover.Path)
+                : Notes.Warn("移除遗留文件失败", leftover.Note + "（删除失败，请手工核对）", leftover.Path));
+        }
+        else if (plan.ExtraRemoval is { } planned)
+        {
+            notes.Add(Notes.Info("空槽", planned.Note, planned.Path));
+        }
+
         // ---- 层 3：config.json 的 userSettings ----
         if (plan.PermissionLayer)
         {
@@ -772,6 +862,15 @@ public sealed class AntigravityTarget : ITargetAdapter
     /// <summary>先备份、无备份不写；污染 / 不可读的旧备份另存证据后重建；已有的干净备份不覆盖。</summary>
     private static void BackupFile(string path, string originalText, List<Note> notes, string what)
     {
+        // 自家内容不备份：备份要留给**用户原文件**。切换注入方案时，另一套方案写下的文件同样是自家的，
+        // 把它备份成"用户原文件"会让 revert 还原出一份注入文本（那正是工具一直警告的"备份污染"）。
+        if (AntigravityRules.IsOurs(originalText))
+        {
+            notes.Add(Notes.Info("不备份自家内容",
+                $"{what} 的现有内容是本工具写的（含注入标记，可能来自另一套方案）：不为它建备份。", path));
+            return;
+        }
+
         var bm = new BackupManager(path);
         var ab = bm.Assess(AntigravityMarkers.BackupMarkers);
 
@@ -1042,7 +1141,7 @@ public sealed class AntigravityTarget : ITargetAdapter
         var id = AntigravityDb.ResolveSessionId(loc.ConversationsDir, sessionId, ct);
         var extract = AntigravityDb.Extract(loc.ConversationsDir, id, ct);
 
-        var report = MarkerScanner.Scan(id, extract.Text, AntigravityMarkers.MarkerSpecs);
+        var report = MarkerScanner.Scan(id, extract.Text, AntigravityMarkers.SpecsForScheme(Ctx.ActiveScheme()));
         var total = report.Hits.Sum(h => h.Count);
 
         report.Verdict = report.Verdict +
@@ -1122,7 +1221,7 @@ public sealed class AntigravityTarget : ITargetAdapter
             Lines = lines,
             AddedLines = added,
             RemovedLines = removed,
-            MarkerDelta = AntigravityMarkers.MarkerSpecs
+            MarkerDelta = AntigravityMarkers.SpecsForScheme(Ctx.ActiveScheme())
                 .Select(s => new MarkerHit
                 {
                     Marker = s.Marker,

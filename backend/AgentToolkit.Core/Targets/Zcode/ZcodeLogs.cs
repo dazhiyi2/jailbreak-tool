@@ -42,6 +42,15 @@ public static class ZcodeLogs
 
     public static string RolloutDir(string home) => Path.Combine(home, "cli", "rollout");
 
+    /// <summary>
+    /// 按方案取标记规格：protocol 方案下载荷层是 gpt-instruct 原文，
+    /// 载荷层标记必须换成 B 套标记（否则命中数判据永远 0，那是假结论）。
+    /// </summary>
+    public static IReadOnlyList<MarkerSpec> SpecsForScheme(InjectionScheme scheme) =>
+        scheme == InjectionScheme.Protocol
+            ? SchemeMarkers.ReplaceLayer(MarkerSpecs, MarkerLayer.ContextPayload, SchemeMarkers.Protocol)
+            : MarkerSpecs;
+
     /// <summary>会话 Id：文件名里 <c>model-io-sess_</c> 之后的部分。</summary>
     public static string IdOf(string path)
     {
@@ -295,7 +304,12 @@ public static class ZcodeLogs
     /// 纪律：**读取失败一律抛异常，绝不静默返回空文本**——空文本会被 MarkerScanner 判成"两层都没进上下文"，
     /// 把用户引到"注入未生效"的错误排查方向（这是本工具最容易误导人的一个坑）。
     /// </summary>
-    public static MarkerReport CheckMarkers(string home, string? sessionId, int maxScanChars, CancellationToken ct)
+    public static MarkerReport CheckMarkers(string home, string? sessionId, int maxScanChars, CancellationToken ct) =>
+        CheckMarkers(home, sessionId, maxScanChars, MarkerSpecs, ct);
+
+    /// <summary>按方案用对应标记集（protocol → B 套载荷层标记）。</summary>
+    public static MarkerReport CheckMarkers(string home, string? sessionId, int maxScanChars,
+        IReadOnlyList<MarkerSpec> specs, CancellationToken ct)
     {
         var path = ResolvePath(home, sessionId);
         if (path is null)
@@ -360,7 +374,7 @@ public static class ZcodeLogs
         }
 
         // TotalChars 就是这里拼好的全文长度（MarkerScanner.Scan 里 text.Length），不是某个字段的长度。
-        return MarkerScanner.Scan(resolvedId, text, MarkerSpecs);
+        return MarkerScanner.Scan(resolvedId, text, specs);
     }
 
     /// <summary>把某个会话的 system 提示词导出成文本文件，返回路径（供 MarkerReport.ExportedSystemPromptPath 用）。</summary>

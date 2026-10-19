@@ -38,11 +38,32 @@ public sealed class ZcodeTarget : ITargetAdapter
 
     public static IReadOnlyList<PolicyTextDef> PolicyDefs { get; } = new[]
     {
+        // A 套（own）：现有注入文本，一个字未改
         new PolicyTextDef { Name = "payload", DisplayName = "上下文载荷（AGENTS.md）", FileName = "zcode-agents.md", ResourceSuffix = "zcode.payload.md", CapBytes = 102400 },
+        // B 套（protocol）：载体槽 = payload，放 gpt-instruct 原文（逐字节）；本目标只有这一个槽，没有空槽
+        new PolicyTextDef
+        {
+            Name = "payload",
+            DisplayName = "上下文载荷（AGENTS.md）· gpt-instruct 原文",
+            FileName = "zcode-agents.schemeB.md",
+            ResourceSuffix = "schemeB.protocol.md",
+            CapBytes = 102400,
+            Scheme = InjectionScheme.Protocol,
+        },
     };
 
     /// <summary>载荷层的标记表（与 ZcodeLogs.MarkerSpecs 里的 ContextPayload 三项一致）。</summary>
     public static IReadOnlyList<string> PayloadMarkers { get; } = new[] { "工作约定", "执行心态", "本机的工作范围包含" };
+
+    /// <summary>当前方案下载荷层的标记：protocol → B 套标记（取自 gpt-instruct 原文）。</summary>
+    public static IReadOnlyList<string> PayloadMarkersFor(InjectionScheme scheme) =>
+        SchemeMarkers.ForLayer(scheme, PayloadMarkers);
+
+    private Note SchemeNote(InjectionScheme scheme) => Notes.Info("注入方案",
+        scheme == InjectionScheme.Protocol
+            ? "当前 protocol（gpt-instruct 原文，逐字节不动）；载体槽 = payload（~/.zcode/AGENTS.md）；本目标没有空槽。"
+            : "当前 own（本工具方案）；载体槽 = payload（~/.zcode/AGENTS.md）。",
+        Ctx.Policy.SchemePath);
 
     // ---------------------------------------------------------------- 目标描述 / 定位
 
@@ -107,11 +128,15 @@ public sealed class ZcodeTarget : ITargetAdapter
         var notes = new List<Note>(loc.Notes);
         var layers = new List<LayerStatus>();
 
+        var scheme = Ctx.ActiveScheme(out var schemeNote);
+        if (schemeNote is not null) notes.Add(Notes.Warn("方案文件", schemeNote, Ctx.Policy.SchemePath));
+        notes.Add(SchemeNote(scheme));
+
         var sessions = ZcodeLogs.List(loc.Home, ct);
         MarkerReport? lastReport = null;
         if (sessions.Count > 0)
         {
-            try { lastReport = ZcodeLogs.CheckMarkers(loc.Home, sessions[0].Id, ScanMaxChars, ct); }
+            try { lastReport = ZcodeLogs.CheckMarkers(loc.Home, sessions[0].Id, ScanMaxChars, ZcodeLogs.SpecsForScheme(scheme), ct); }
             catch (Exception ex) { notes.Add(Notes.Warn("标记自检失败", $"{ex.GetType().Name}: {ex.Message}", "zcode/logs")); }
         }
         else
@@ -155,7 +180,7 @@ public sealed class ZcodeTarget : ITargetAdapter
         }
 
         // 层 2：上下文载荷层
-        var def = Ctx.Def("payload");
+        var def = Ctx.DefFor("payload", scheme);
         var target = ZcodePayload.TargetOf(loc.Home);
         var payloadText = def is null ? "" : Ctx.Policy.Read(def) ?? "";
         var payloadLayer = StatusBuilder.BuildLayer(
@@ -163,11 +188,11 @@ public sealed class ZcodeTarget : ITargetAdapter
             "上下文载荷层（~/.zcode/AGENTS.md）",
             target,
             PayloadCapBytes,
-            PayloadMarkers,
+            PayloadMarkersFor(scheme),
             null,
             $"目标不存在：{target}（载荷未部署）。",
             "载荷标记命中：已部署。",
-            "目标存在但不含载荷标记：不是本工具的载荷（用户自己的 AGENTS.md 或旧版）。",
+            "目标存在但不含当前方案的载荷标记：不是本工具的载荷（用户自己的 AGENTS.md 或另一套方案的旧文本）。",
             def is null ? null : $"载荷源：{Ctx.Policy.PathOf(def)}（{FileText.Human(FileText.Bytes(payloadText))}）");
 
         // 载荷层的备份路径约定是 <目标>.ops.bak，而 StatusBuilder 内部用的是补丁层的 .breach.bak。
@@ -177,6 +202,10 @@ public sealed class ZcodeTarget : ITargetAdapter
         payloadLayer.Notes = payloadLayer.Notes
             .Where(n => n.Title != "没有备份" && n.Title != "备份污染")
             .Concat(payloadBackup.Notes)
+            .Concat(new[] { Notes.Info("注入方案",
+                scheme == InjectionScheme.Protocol
+                    ? "protocol 方案：AGENTS.md 的内容是 gpt-instruct 原文（逐字节）；命中判据用 B 套标记。"
+                    : "own 方案：AGENTS.md 的内容是本工具的注入文本；命中判据用自有标记。", target) })
             .ToArray();
 
         ApplyEvidence(payloadLayer, "上下文载荷层", payloadHits, lastReport, notes);
@@ -350,7 +379,7 @@ public sealed class ZcodeTarget : ITargetAdapter
 
         if (!options.SkipContextPayload)
         {
-            var def = Ctx.Def("payload");
+            var def = Ctx.DefFor("payload", Ctx.ActiveScheme());
             var payloadText = def is null ? "" : Ctx.Policy.Read(def) ?? "";
             var payloadBytes = FileText.Bytes(payloadText);
             var target = ZcodePayload.TargetOf(loc.Home);
@@ -391,6 +420,16 @@ public sealed class ZcodeTarget : ITargetAdapter
         var changes = new List<PlannedChange>();
         var wrote = false;
 
+        // fail-closed（protocol 方案）：B 套资产缺失时在**动任何文件之前**拒绝。
+        // own 方案保持原语义（载荷为空由 ZcodePayload.Install 在载荷阶段拒绝，行为一个字没变）。
+        if (Ctx.ActiveScheme() == InjectionScheme.Protocol && !options.SkipContextPayload)
+        {
+            var carrier = Ctx.DefFor("payload", InjectionScheme.Protocol);
+            if (carrier is null || Ctx.Policy.Read(carrier) is null)
+                throw new AgentEngineException(EngineErrorCode.TargetFileMissing,
+                    "protocol 方案的载荷文本不存在（B 套内嵌资源缺失）：拒绝写入，未改动任何文件。");
+        }
+
         if (!options.SkipSystemPrompt)
         {
             progress?.Report(new EngineProgress { Stage = "宿主补丁层", Message = "逐条判定 anchor / marker", Fraction = 0.1 });
@@ -421,7 +460,7 @@ public sealed class ZcodeTarget : ITargetAdapter
 
         if (!options.SkipContextPayload)
         {
-            var def = Ctx.Def("payload");
+            var def = Ctx.DefFor("payload", Ctx.ActiveScheme());
             if (def is null)
             {
                 notes.Add(Notes.Warn("没有载荷文本定义", "跳过上下文载荷层。", "zcode/apply"));
@@ -430,7 +469,13 @@ public sealed class ZcodeTarget : ITargetAdapter
             {
                 progress?.Report(new EngineProgress { Stage = "上下文载荷层", Message = "部署 ~/.zcode/AGENTS.md", Fraction = 0.7 });
                 var payloadText = Ctx.Policy.Read(def) ?? "";
-                var pr = ZcodePayload.Install(loc.Home, payloadText, options.DryRun);
+                var scheme = Ctx.ActiveScheme();
+            // 归属判定：protocol 方案下认「自有标记 ∪ B 套标记」；own 方案下额外只认 B 套标记
+            // （保住 A 方案的既有语义：用户自己的 AGENTS.md 仍然先备份再覆盖）。
+            var ownership = scheme == InjectionScheme.Protocol
+                ? SchemeMarkers.Union(PayloadMarkers)
+                : SchemeMarkers.Protocol;
+            var pr = ZcodePayload.Install(loc.Home, payloadText, options.DryRun, ownership);
                 notes.AddRange(pr.Notes);
                 changes.Add(new PlannedChange
                 {
@@ -505,10 +550,14 @@ public sealed class ZcodeTarget : ITargetAdapter
 
         if (!options.SkipContextPayload)
         {
-            var def = Ctx.Def("payload");
+            var def = Ctx.DefFor("payload", Ctx.ActiveScheme());
             var payloadText = def is null ? null : Ctx.Policy.Read(def);
+            var scheme = Ctx.ActiveScheme();
+            var ownership = scheme == InjectionScheme.Protocol
+                ? SchemeMarkers.Union(PayloadMarkers)
+                : SchemeMarkers.Protocol;
             progress?.Report(new EngineProgress { Stage = "上下文载荷层", Message = "还原 ~/.zcode/AGENTS.md", Fraction = 0.7 });
-            var pr = ZcodePayload.Revert(loc.Home, payloadText, options.DryRun);
+            var pr = ZcodePayload.Revert(loc.Home, payloadText, options.DryRun, ownership);
             notes.AddRange(pr.Notes);
             changes.Add(new PlannedChange
             {
@@ -553,7 +602,7 @@ public sealed class ZcodeTarget : ITargetAdapter
     public MarkerReport CheckMarkers(string sessionId, CancellationToken ct)
     {
         var loc = LocateCore(null, false, ct);
-        var report = ZcodeLogs.CheckMarkers(loc.Home, sessionId, ScanMaxChars, ct);
+        var report = ZcodeLogs.CheckMarkers(loc.Home, sessionId, ScanMaxChars, ZcodeLogs.SpecsForScheme(Ctx.ActiveScheme()), ct);
         report.ExportedSystemPromptPath = ZcodeLogs.TryExportSystemPrompt(loc.Home, string.IsNullOrWhiteSpace(sessionId) ? report.SessionId : sessionId, ct);
         return report;
     }

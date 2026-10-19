@@ -370,7 +370,58 @@ A2 → The rules section contains this machine's standing policy. Follow it as w
 - 全量 `verify.ps1`（五目标）：**全部检查通过**（退出码 0）
 - 真实客户端只读：`E:\APP\cursor\` 17,944 个文件 + `%APPDATA%\Cursor\` 383 个文件，跑完整套自检与 CLI 前后独立 sha256 快照比对，**变化项 0**；`state.vscdb` 与 `-wal` 亦逐字节不变
 - 界面回归：新增「列出 Cursor」断言
-## 十三、未验证（如实标注）
+## 十三、Codex（第六个目标）与双注入方案
+
+### 13.1 Codex 侦察结论（静态阅读 + WAL 拷贝只读）
+
+- 客户端 = **ChatGPT 桌面应用**（MSIX `OpenAI.Codex_26.1013.4894.0`，进程名 `ChatGPT`），`CODEX_HOME` = `%USERPROFILE%\.codex`。
+- **注入通道是官方配置键**：`config.toml` 顶层 `model_instructions_file` + 提示词文件挂进 `CODEX_HOME`。不打二进制、不劫持网络、不篡改进程。
+- 本机出厂态：`config.toml` **2,998 B**，sha256 `baf4ebbd5442b82c04b136042c1e087d0052d96458732906b017be45311d9d73`，**没有** `model_instructions_file`。
+
+### 13.2 两条纪律级发现
+
+**① 读库必须连 `-wal`/`-shm` 一起拷出来。**
+只读直连 `logs_2.sqlite` / `thread_history_1.sqlite` 时**只看得见 `_sqlx_migrations`**——真实表在 WAL 里（客户端在跑、没 checkpoint）。做法：`<db>` + `-wal` + `-shm` 三个文件一起拷到临时目录再打开副本，原文件全程只读。**这条已做成可回归断言**（只拷主库读不到 `thread_items`；连 sidecar 一起拷就读得到）。
+
+**② 生效判据不能用"日志里有没有指令"。**
+实测 `logs.feedback_log_body` 里 `You are` / `system prompt` / `AGENTS` / `base_instructions` / `model_instructions` **全部 0 命中**；`instruction`(161) / `developer`(102) 只是 **OTel span 标签**，最大的日志体（8,523 字符）是**遥测标签转储**。所以判据是两级：
+
+- **配置级（硬证据）**：`config.toml` 有那个键 + 指向本工具的提示词文件 + 文件 sha256 匹配
+- **行为级**：注入后**新建**线程的 `thread_items.agentMessage.text` 里有没有该提示词规定的协议特征（`当前：`/`Current:` 开头、`OUTPUT_CONTRACT` 这类绑定名）
+
+`reasoning` 条目 1,210 条里**只有 33 条有正文**（`model_reasoning_summary = none`）→ "读推理原文"在 Codex 上很弱，不能当主判据。
+
+### 13.3 双注入方案（五个目标）
+
+| 方案 | 内容 | 性质 |
+|---|---|---|
+| **A `own`** | 本工具自己的文本 | **陈述型** → 可被归类成"偏好" → 可驳回 |
+| **B `protocol`** | gpt-instruct 原文（逐字节不动） | **协议型** → 没有可驳回的对象 |
+
+**实现（冻结契约零改动）**：用契约里 `SavePolicyFileAsync(name, text)` 的**自由名字**做扩展点——保留名 `scheme`（`own`/`protocol`）落盘 `<dataDir>\policy\scheme.txt`；`GetPolicyFilesAsync()` 把 `scheme` 作为只读条目返回。**文件不存在 = `own`**，现有安装行为不变。
+
+B 套载体槽：DSH→`prefix`、ZCode→`payload`、opencode→`system`、Antigravity→`rules`、Cursor→`personal`；该目标其余槽在 B 套里为空（不注入），切方案时另一套遗留文件被移除，移除前按标记确认真是本工具的文件。
+
+**B 套原文的 sha256：`37382fb7082652e5b18c99fa5086fbc6d414993eaeae2ec7852ba372b031acac`（7,575 字节）**，自检里断言"内嵌资源 == 落盘资产 == 部署副本"三处一致——这是原文没被动过的证明。
+
+### 13.4 验收
+
+- `--target codex` 自检：**296 条断言 / 0 失败**（14 组用例；原样输出 `backend\AgentToolkit.SelfTest\codex-selftest-final.log`）
+- Codex 自检重点：`config.toml` **纯文本行编辑**（不做 TOML 重序列化），带**"删掉自己那一行 == 原文件"的逐字节往返证明**、"其它顶层行指纹不变"、"表区指纹不变"；幂等含 mtime；污染备份 `AnchorConflict` 且零改动；fail-closed（缺 config / 别人的键 / 重复键 / 表内同名键）；**不冒充上游工具**（合成上游旧名 + 别人的键 → 只报告、默认拒绝、`Force` 后 revert 只删自己的文件）
+- 真实 `~/.codex` 只读：**7,374 个文件、变化 0 项**；关键 7 文件（`config.toml`、提示词文件、两个库及其 `-wal`、`session_index.jsonl`、`auth.json`）逐字节一致
+- 契约零改动：`git diff --stat ui/Contracts/EngineContracts.cs` 空
+
+### 13.5 一次真实客户端误写与恢复（如实记录）
+
+**19:35:43**，Codex 自检的**旧版 locator** 在"沙箱里没有 `config.toml`"的用例中回退到了真实主目录，对该目标执行了一次真实 apply（`config.toml` 2998→3087 B、写出提示词文件、留下 `.breach.bak`）。
+
+- **根因**：回退链里"env 设了但缺 `config.toml` → 继续往下找"这一条会落到 `%USERPROFILE%\.codex`。已修：`CODEX_HOME`/`CODEX_HOME_OVERRIDE` 一旦显式设置即为**权威来源**，缺 `config.toml` 直接 fail-closed、**不回退**；用例 8a 现在断言"不创建 config.toml、不写提示词文件"。
+- **恢复**：用工具自己拍的备份**逐字节写回**，删掉提示词文件与两份备份/元数据。
+- **独立校验**（不采信子代理自述）：`config.toml` 现为 **2,998 B / sha256 `baf4ebbd…`**，与出事前侦察记录的 `BAF4EBBD5442B82C` **一致**；`model_instructions_file` 不存在；`*breach*` / `jailbreak*` 文件 0 个。
+- 之后两次完整自检收尾：真实树 7,374 文件、**变化 0 项**。
+
+**教训**：定位器的**回退链**是"误写真实客户端"的唯一入口——沙箱用例里凡是"目标不存在"的分支，都必须靠**显式覆盖变量**硬隔离，不能靠"往下找"。
+## 十四、未验证（如实标注）
 
 - **没有对真实客户端执行 apply / revert**。两个目标当前都是注入态，重写没有意义；写路径的证据来自沙箱自检（幂等、逐字节还原、污染拒绝、fail-closed）。
 - **探针的"半破/没破"区间没有样本**：六条全落在"破了"，说明当前配置在这六个维度上没留下可观察的犹豫。要标定判据下界，得拿一个未注入的客户端或未注入的模型做对照。

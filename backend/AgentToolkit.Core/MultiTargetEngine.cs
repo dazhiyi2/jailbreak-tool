@@ -2,6 +2,7 @@ using AgentToolkit.Contracts;
 using AgentToolkit.Core.Support;
 using AgentToolkit.Core.Targets;
 using AgentToolkit.Core.Targets.Antigravity;
+using AgentToolkit.Core.Targets.Codex;
 using AgentToolkit.Core.Targets.Cursor;
 using AgentToolkit.Core.Targets.Dsh;
 using AgentToolkit.Core.Targets.Opencode;
@@ -28,6 +29,7 @@ public sealed class MultiTargetEngine : IAgentEngine
         Register(new OpencodeTarget(BuildContext("opencode", root)));
         Register(new AntigravityTarget(BuildContext("antigravity", root)));
         Register(new CursorTarget(BuildContext("cursor", root)));
+        Register(new CodexTarget(BuildContext("codex", root)));
 
         _currentId = _adapters.ContainsKey("dsh") ? "dsh" : _adapters.Keys.First();
     }
@@ -45,6 +47,8 @@ public sealed class MultiTargetEngine : IAgentEngine
             "zcode" => ZcodeTarget.PolicyDefs,
             "opencode" => OpencodeTarget.PolicyDefs,
             "cursor" => CursorTarget.PolicyDefs,
+            // 必须显式列出：下面的 `_ =>` 兜底是 Antigravity，漏了 codex 会让它拿到 Antigravity 的注入文本。
+            "codex" => CodexTarget.PolicyDefs,
             _ => AntigravityTarget.PolicyDefs,
         };
         var policy = new PolicyStore(dataDir);
@@ -125,6 +129,8 @@ public sealed class MultiTargetEngine : IAgentEngine
         "opencode" => "opencode-cli",
         "antigravity" => "Antigravity",
         "cursor" => "Cursor",
+        // Codex 的客户端是 ChatGPT 桌面应用，进程名是 ChatGPT（不是 codex）。
+        "codex" => "ChatGPT",
         _ => null,
     };
 
@@ -153,11 +159,37 @@ public sealed class MultiTargetEngine : IAgentEngine
     public Task<DiffReport> GetSystemPromptDiffAsync(string? sessionId = null, CancellationToken ct = default) =>
         Run(() => Current.GetSystemPromptDiff(sessionId, ct), ct);
 
+    // 注入方案选择器（保留名 scheme）：目标适配器通过 StatusBuilder 提供它（<dataDir>\policy\scheme.txt）。
+    // 这里再显式兜底一次，保证界面 / CLI 无论走哪个适配器都拿得到、也切得动当前方案。
     public Task<IReadOnlyList<PolicyFileInfo>> GetPolicyFilesAsync(CancellationToken ct = default) =>
-        Run(() => Current.GetPolicyFiles(ct), ct);
+        Run<IReadOnlyList<PolicyFileInfo>>(() =>
+        {
+            var files = Current.GetPolicyFiles(ct).ToList();
+            if (!files.Any(f => string.Equals(f.Name, SchemeText.EntryName, StringComparison.OrdinalIgnoreCase)))
+                files.Insert(0, StatusBuilder.SchemeFile(Current.Ctx));
+            return files;
+        }, ct);
 
     public Task<PolicyFileInfo> SavePolicyFileAsync(string name, string text, CancellationToken ct = default) =>
-        Run(() => Current.SavePolicyFile(name, text, ct), ct);
+        Run(() =>
+        {
+            if (!string.Equals(name, SchemeText.EntryName, StringComparison.OrdinalIgnoreCase))
+                return Current.SavePolicyFile(name, text, ct);
+
+            // 方案选择器统一在引擎这一层落盘：非法值 fail-closed（不猜、不写），合法值规范化后写 scheme.txt。
+            if (!SchemeText.TryParse(text, out var scheme))
+                throw new AgentEngineException(EngineErrorCode.VerifyProblems,
+                    $"注入方案只认 own / protocol（收到「{(text ?? "").Trim()}」）：拒绝写入。",
+                    new[]
+                    {
+                        Notes.Info("注入方案",
+                            "own = 本工具方案（现有注入文本，一个字不改）；protocol = gpt-instruct 原文（逐字节不动）。",
+                            Current.Ctx.Policy.SchemePath),
+                    });
+
+            Current.Ctx.Schemes().Write(scheme);
+            return StatusBuilder.SchemeFile(Current.Ctx);
+        }, ct);
 
     public Task<IReadOnlyList<ProbeDefinition>> GetProbesAsync(CancellationToken ct = default) =>
         Run(() => Current.GetProbes(), ct);

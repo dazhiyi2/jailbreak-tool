@@ -76,4 +76,13 @@ public static class OpencodeMarkers
     /// <summary>某个条目集合里的命中总数（人话：命中 0 = 这一层没进模型上下文）。</summary>
     public static int CountHits(string text, IReadOnlyList<string> markers) =>
         markers.Sum(m => FileText.Count(text, m));
+
+    /// <summary>
+    /// 按方案取标记规格：protocol 方案下系统提示词层是 gpt-instruct 原文，
+    /// 系统层标记必须换成 B 套标记（否则命中数判据永远 0，那是假结论）。
+    /// </summary>
+    public static IReadOnlyList<MarkerSpec> SpecsForScheme(InjectionScheme scheme) =>
+        scheme == InjectionScheme.Protocol
+            ? SchemeMarkers.ReplaceLayer(MarkerSpecs, MarkerLayer.SystemPrompt, SchemeMarkers.Protocol)
+            : MarkerSpecs;
 }

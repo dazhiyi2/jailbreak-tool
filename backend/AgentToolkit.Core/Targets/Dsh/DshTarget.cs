@@ -40,10 +40,45 @@ public sealed class DshTarget : ITargetAdapter
 
     public static IReadOnlyList<PolicyTextDef> PolicyDefs { get; } = new[]
     {
+        // ---- A 套（own）：现有注入文本，一个字未改 ----
         new PolicyTextDef { Name = "prefix", DisplayName = "系统提示词前缀（order 0）", FileName = "persona-prefix.txt", ResourceSuffix = "dsh.prefix.txt" },
         new PolicyTextDef { Name = "suffix", DisplayName = "系统提示词后缀（order 10200，位置最靠后）", FileName = "persona-suffix.txt", ResourceSuffix = "dsh.suffix.txt", Required = false },
         new PolicyTextDef { Name = "payload", DisplayName = "上下文载荷（AGENTS.md）", FileName = "dsh-agents.md", ResourceSuffix = "dsh.payload.md", CapBytes = 65536 },
+
+        // ---- B 套（protocol）：载体槽 = prefix，放 gpt-instruct 原文（schemeB.protocol.md，同一份资产服务全部目标）；
+        //      suffix / payload 是空槽：不写文件、不产生计划变更，切换时移除 A 套遗留。
+        new PolicyTextDef
+        {
+            Name = "prefix",
+            DisplayName = "系统提示词前缀（order 0）· gpt-instruct 原文",
+            FileName = "persona-prefix.schemeB.txt",
+            ResourceSuffix = SchemeBProtocolSuffix,
+            Scheme = InjectionScheme.Protocol,
+        },
+        new PolicyTextDef
+        {
+            Name = "suffix",
+            DisplayName = "系统提示词后缀（protocol 方案下为空槽：不注入）",
+            FileName = "persona-suffix.schemeB.txt",
+            ResourceSuffix = SchemeBEmptySuffix,
+            Required = false,
+            Editable = false,
+            Scheme = InjectionScheme.Protocol,
+        },
+        new PolicyTextDef
+        {
+            Name = "payload",
+            DisplayName = "上下文载荷（protocol 方案下为空槽：不注入）",
+            FileName = "dsh-agents.schemeB.md",
+            ResourceSuffix = SchemeBEmptySuffix,
+            Required = false,
+            Editable = false,
+            Scheme = InjectionScheme.Protocol,
+        },
     };
+
+    private const string SchemeBProtocolSuffix = "schemeB.protocol.md";
+    private const string SchemeBEmptySuffix = "schemeB.empty.md";
 
     // ================================================================ 定位 / 描述
     public TargetInfo Describe(CancellationToken ct)
@@ -115,16 +150,20 @@ public sealed class DshTarget : ITargetAdapter
         var notes = new List<Note>();
         notes.AddRange(loc.Notes.Where(n => n.Severity != Severity.Info));
 
+        var scheme = Ctx.ActiveScheme(out var schemeNote);
+        if (schemeNote is not null) notes.Add(Notes.Warn("方案文件", schemeNote, Ctx.Policy.SchemePath));
+        notes.Add(SchemeNote(scheme));
+
         var sessions = DshSessions.List(home);
         MarkerReport? last = null;
         if (sessions.Count > 0)
         {
-            try { last = DshSessions.Check(home, sessions[0].Id, ct); }
+            try { last = DshSessions.Check(home, sessions[0].Id, DshMarkers.SpecsForScheme(scheme), ct); }
             catch (Exception ex) { notes.Add(Notes.Warn("最近会话读不了", ex.Message, sessions[0].Id)); }
         }
 
-        var layers = new List<LayerStatus> { SystemLayer(patch, last, ct) };
-        layers.Add(PayloadLayer(agents));
+        var layers = new List<LayerStatus> { SystemLayer(patch, last, ct, scheme) };
+        layers.Add(PayloadLayer(agents, scheme));
 
         var pids = PathProbe.ProcessIds(DshLocator.ProcessName);
         var running = pids.Count > 0;
@@ -170,7 +209,18 @@ public sealed class DshTarget : ITargetAdapter
         };
     }
 
-    private LayerStatus SystemLayer(string patch, MarkerReport? last, CancellationToken ct)
+    /// <summary>状态页与 CLI 都要看见当前方案：载体槽是哪个、哪些槽位在当前方案下不注入。</summary>
+    private Note SchemeNote(InjectionScheme scheme)
+    {
+        var empties = Ctx.EmptySlotNames(scheme);
+        var detail = scheme == InjectionScheme.Protocol
+            ? "当前 protocol（gpt-instruct 原文，逐字节不动）；载体槽 = prefix（系统提示词前缀 order 0）；" +
+              $"空槽 = {string.Join("、", empties)}（suffix 不进受管段；payload 不写 AGENTS.md，A 套遗留的会被移除）。"
+            : "当前 own（本工具方案，现有注入文本一个字未改）；载体槽 = prefix + suffix（受管段）与 payload（AGENTS.md）。";
+        return Notes.Info("注入方案", detail, Ctx.Policy.SchemePath);
+    }
+
+    private LayerStatus SystemLayer(string patch, MarkerReport? last, CancellationToken ct, InjectionScheme scheme)
     {
         var markers = new[] { DshPatcher.MarkBegin, DshPatcher.MarkEnd };
         var layer = StatusBuilder.BuildLayer(
@@ -229,25 +279,38 @@ public sealed class DshTarget : ITargetAdapter
             layer.EffectivenessEvidence = string.Join(" ", evidence);
         }
 
-        layer.Notes = layer.Notes.Concat(new[] { Notes.Info("受管段", ManagedNote, patch) }).ToArray();
+        layer.Notes = layer.Notes.Concat(new[]
+        {
+            Notes.Info("受管段", ManagedNote, patch),
+            Notes.Info("注入方案", scheme == InjectionScheme.Protocol
+                ? "protocol 方案：受管段里的 personaPrefix 是 gpt-instruct 原文（逐字节），personaSuffix 不写（空槽）。"
+                : "own 方案：受管段里的 personaPrefix / personaSuffix 是本工具的注入文本。", patch),
+        }).ToArray();
         return layer;
     }
 
-    private static LayerStatus PayloadLayer(string agents)
+    private LayerStatus PayloadLayer(string agents, InjectionScheme scheme)
     {
+        var markers = SchemeMarkers.ForLayer(scheme, DshMarkers.ContextPayloadMarkers);
         var layer = StatusBuilder.BuildLayer(
             LayerKind.ContextPayload,
             "上下文载荷层（AGENTS.md）",
             agents,
             65536,
-            DshMarkers.ContextPayloadMarkers,
+            markers,
             parseOk: null,
-            absentDetail: "AGENTS.md 不存在：载荷层未部署。",
-            appliedDetail: "AGENTS.md 存在且含载荷标记。",
-            notAppliedDetail: "AGENTS.md 存在，但内容不是本工具的载荷。");
+            absentDetail: scheme == InjectionScheme.Protocol
+                ? "protocol 方案下 payload 是空槽：不写 AGENTS.md（A 套遗留的会被 apply 移除）。"
+                : "AGENTS.md 不存在：载荷层未部署。",
+            appliedDetail: "AGENTS.md 存在且含当前方案的载荷标记。",
+            notAppliedDetail: "AGENTS.md 存在，但内容不是本工具当前方案的载荷。");
 
         var opsBak = agents + ".ops.bak";
         var extra = new List<Note>();
+        if (scheme == InjectionScheme.Protocol)
+            extra.Add(Notes.Info("注入方案",
+                "protocol 方案：payload 是空槽（不注入）。该文件若含本工具标记，apply 会移除它；不是本工具的则一律不动。",
+                agents));
         if (File.Exists(opsBak))
             extra.Add(Notes.Info("载荷层备份", $"载荷层的备份在 {opsBak}（install.ps1 的 .ops.bak 口径）。", agents));
         if (layer.State != LayerState.TargetAbsent && layer.Backup.Health == BackupHealth.Absent)
@@ -345,6 +408,20 @@ public sealed class DshTarget : ITargetAdapter
         {
             progress?.Report(new EngineProgress { Stage = "payload", Message = "部署 AGENTS.md", Fraction = 0.85 });
             DeployPayload(plan.PayloadPlan, notes);
+        }
+
+        // ---- 空槽清理（protocol 方案：payload 不注入，A 套遗留的本工具文件要移除） ----
+        if (plan.PayloadPlan.Removal is { WillWrite: true } leftover)
+        {
+            progress?.Report(new EngineProgress { Stage = "cleanup", Message = "移除另一套方案遗留的 AGENTS.md", Fraction = 0.9 });
+            var deleted = SchemeSlotFile.Execute(leftover);
+            notes.Add(deleted
+                ? Notes.Info("已移除遗留文件", leftover.Note, leftover.Path)
+                : Notes.Warn("移除遗留文件失败", leftover.Note + "（删除失败，请手工核对）", leftover.Path));
+        }
+        else if (plan.PayloadPlan.Removal is { } planned)
+        {
+            notes.Add(Notes.Info("空槽", planned.Note, planned.Path));
         }
 
         return new ApplyResult
@@ -530,7 +607,12 @@ public sealed class DshTarget : ITargetAdapter
         var existing = FileText.ReadOrNull(target);
         var saved = FileText.ReadOrNull(opsBak);
         var feature = FirstLine(SafePayloadText()).Trim();
-        var isOurs = existing is not null && feature.Length > 0 && existing.Contains(feature, StringComparison.Ordinal);
+        // 归属判定：own 方案按载荷首行（与改动前完全一致）；空槽方案（protocol）没有首行，
+        // 改用标记集（自有标记 ∪ B 套标记）判"是不是本工具写的"，别人的文件一律不动。
+        var ownership = SchemeMarkers.Union(DshMarkers.ContextPayloadMarkers);
+        var isOurs = existing is not null && (feature.Length > 0
+            ? existing.Contains(feature, StringComparison.Ordinal)
+            : ownership.Any(m => !string.IsNullOrEmpty(m) && existing.Contains(m, StringComparison.Ordinal)));
 
         if (saved is not null)
         {
@@ -586,7 +668,7 @@ public sealed class DshTarget : ITargetAdapter
 
     private string SafePayloadText()
     {
-        var def = Ctx.Def("payload");
+        var def = Ctx.DefFor("payload", Ctx.ActiveScheme());
         if (def is null) return "";
         try { return Ctx.Policy.Read(def) ?? ""; } catch { return ""; }
     }
@@ -600,11 +682,14 @@ public sealed class DshTarget : ITargetAdapter
         var problems = new List<string>();
         var failCode = EngineErrorCode.SelfCheckFailed;
 
-        var prefix = ReadPolicyText(options.PolicyPrefixPath, "prefix", required: true);
-        var suffix = ReadPolicyText(options.PolicySuffixPath, "suffix", required: false);
+        var scheme = Ctx.ActiveScheme(out _);
+        var prefix = ReadPolicyText(options.PolicyPrefixPath, "prefix", required: true, scheme);
+        var suffix = ReadPolicyText(options.PolicySuffixPath, "suffix", required: false, scheme);
+        // 空槽（Required=false 且文本为空）：不写文件、不产生计划变更；A 套遗留的本工具文件由清理计划移除。
+        var payloadEmptySlot = !options.SkipContextPayload && Ctx.IsEmptySlot("payload", scheme);
         var payloadText = options.SkipContextPayload
             ? ""
-            : ReadPolicyText(options.PayloadPath, "payload", required: true);
+            : ReadPolicyText(options.PayloadPath, "payload", required: !payloadEmptySlot, scheme);
 
         var origin = FileText.ReadOrNull(patch) ?? "";
         var exists = File.Exists(patch);
@@ -651,7 +736,7 @@ public sealed class DshTarget : ITargetAdapter
             }
         }
 
-        var payloadPlan = BuildPayloadPlan(home, payloadText, options);
+        var payloadPlan = BuildPayloadPlan(home, payloadText, options, scheme, payloadEmptySlot);
         var idInput = origin + "\n" + prefix + "\n" + suffix + "\n" + payloadText;
         var previewId = FileText.Sha256Text(idInput)[..16];
 
@@ -677,12 +762,34 @@ public sealed class DshTarget : ITargetAdapter
         };
     }
 
-    private PayloadPlan BuildPayloadPlan(string home, string payloadText, ApplyOptions options)
+    private PayloadPlan BuildPayloadPlan(string home, string payloadText, ApplyOptions options,
+        InjectionScheme scheme, bool emptySlot)
     {
         var target = DshLocator.AgentsFile(home);
-        var def = Ctx.Def("payload");
+        var def = Ctx.DefFor("payload", scheme);
         var cap = def?.CapBytes ?? 65536;
         var existing = FileText.ReadOrNull(target);
+
+        // 空槽：不写文件；只处理"另一套方案遗留的本工具文件"。不是本工具的文件一律不动。
+        if (emptySlot)
+        {
+            var removal = SchemeSlotFile.Plan(target,
+                SchemeMarkers.Union(DshMarkers.ContextPayloadMarkers),
+                "protocol 方案的 payload 是空槽（目标位置不应有本工具的文件）");
+            return new PayloadPlan
+            {
+                Path = target,
+                Text = "",
+                Existing = existing,
+                Enabled = true,
+                WillWrite = false,
+                Removal = removal,
+                DryNote = removal.Note,
+                CapBytes = cap,
+                BeforeBytes = FileText.Bytes(existing ?? ""),
+                AfterBytes = FileText.Bytes(existing ?? ""),
+            };
+        }
 
         // 幂等：磁盘上的内容与将写入的内容逐字节相同就不写。
         // 预览给用户的是承诺，不能说"将写入"却写出一模一样的字节（CanApply / Applied / 体积统计都会因此虚报）。
@@ -725,7 +832,7 @@ public sealed class DshTarget : ITargetAdapter
         };
     }
 
-    private string ReadPolicyText(string? overridePath, string defName, bool required)
+    private string ReadPolicyText(string? overridePath, string defName, bool required, InjectionScheme scheme)
     {
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
@@ -735,7 +842,7 @@ public sealed class DshTarget : ITargetAdapter
             return "";
         }
 
-        var def = Ctx.Def(defName)
+        var def = Ctx.DefFor(defName, scheme)
                   ?? throw new AgentEngineException(EngineErrorCode.Unsupported, $"没有名为「{defName}」的注入文本。");
         var text = Ctx.Policy.Read(def);
         if (text is null)
@@ -758,6 +865,8 @@ public sealed class DshTarget : ITargetAdapter
         public string? Existing { get; init; }
         public bool Enabled { get; init; }
         public bool WillWrite { get; init; }
+        /// <summary>空槽清理计划（protocol 方案下 payload 为空槽时，移除 A 套遗留的本工具文件）。</summary>
+        public SlotRemovalPlan? Removal { get; init; }
         public string? BackupPath { get; init; }
         public string DryNote { get; init; } = "";
         public long CapBytes { get; init; }
@@ -816,7 +925,12 @@ public sealed class DshTarget : ITargetAdapter
                 });
             }
 
-            if (PayloadPlan.Enabled)
+            if (PayloadPlan.Removal is { } removal)
+            {
+                var change = SchemeSlotFile.Change(removal, LayerKind.ContextPayload, "protocol 方案的 payload 空槽");
+                if (change is not null) list.Add(change);
+            }
+            else if (PayloadPlan.Enabled)
             {
                 list.Add(new PlannedChange
                 {
@@ -844,7 +958,7 @@ public sealed class DshTarget : ITargetAdapter
         DshSessions.Load(Home(ct), sessionId, options, ct);
 
     public MarkerReport CheckMarkers(string sessionId, CancellationToken ct) =>
-        DshSessions.Check(Home(ct), sessionId, ct);
+        DshSessions.Check(Home(ct), sessionId, DshMarkers.SpecsForScheme(Ctx.ActiveScheme()), ct);
 
     public DiffReport GetSystemPromptDiff(string? sessionId, CancellationToken ct)
     {
@@ -904,8 +1018,8 @@ public sealed class DshTarget : ITargetAdapter
         };
     }
 
-    private static IReadOnlyList<MarkerHit> MarkerDelta(string before, string after) =>
-        DshMarkers.Specs
+    private IReadOnlyList<MarkerHit> MarkerDelta(string before, string after) =>
+        DshMarkers.SpecsForScheme(Ctx.ActiveScheme())
             .Select(s => new MarkerHit
             {
                 Marker = s.Marker,

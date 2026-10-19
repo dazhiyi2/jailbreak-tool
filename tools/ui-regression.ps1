@@ -122,11 +122,13 @@ else {
     $hasOc = $names -match 'opencode'
     $hasAg = $names -match 'Antigravity'
     $hasCur = $names -match 'Cursor'
+    $hasCx = $names -match 'Codex'
     if ($hasDsh) { Ok "列出 DeepSeek Harness" } else { Bad "下拉里没有 DeepSeek Harness" }
     if ($hasZcode) { Ok "列出 ZCode" } else { Bad "下拉里没有 ZCode" }
     if ($hasOc) { Ok "列出 opencode" } else { Bad "下拉里没有 opencode" }
     if ($hasAg) { Ok "列出 Google Antigravity" } else { Bad "下拉里没有 Google Antigravity" }
     if ($hasCur) { Ok "列出 Cursor" } else { Bad "下拉里没有 Cursor" }
+    if ($hasCx) { Ok "列出 Codex" } else { Bad "下拉里没有 Codex" }
     $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
   } catch { Bad "展开目标选择器失败：$($_.Exception.Message)" }
 }
@@ -293,6 +295,30 @@ if (Click-Button $root '刷新文本') {
   $t = (Get-Texts $root) -join "`n"
   if ($t -match 'persona|agents|KB') { Ok "注入文本页刷新后有内容" } else { Bad "注入文本页刷新后没有内容" }
 } else { Bad "点不到「刷新文本」" }
+
+# 双注入方案：界面必须能切换。**只做只读断言**——展开下拉读选项后收起，不点「切换方案」以免改变方案状态。
+$t = (Get-Texts $root) -join "`n"
+if ($t -match '注入方案') { Ok "注入文本页有「注入方案」区" } else { Bad "注入文本页没有「注入方案」区" }
+if (Get-ByName $root '切换方案') { Ok "有「切换方案」按钮" } else { Bad "找不到「切换方案」按钮" }
+if ($t -match '当前方案') { Ok "显示当前方案" } else { Bad "没显示当前方案" }
+# 折叠的 ComboBox 在视觉树里只暴露选中项，必须展开才能读到全部选项（与目标选择器同一手法）。
+$schemeCombo = (Get-ByType $root ([System.Windows.Automation.ControlType]::ComboBox)) |
+  Where-Object { $_.Current.Name -match '方案' } | Select-Object -First 1
+if (-not $schemeCombo) { $schemeCombo = (Get-ByType $root ([System.Windows.Automation.ControlType]::ComboBox)) | Select-Object -Last 1 }
+if ($schemeCombo) {
+  try {
+    $schemeCombo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    Start-Sleep -Milliseconds 800
+    $schemeNames = @((Get-ByType $root ([System.Windows.Automation.ControlType]::ListItem)) | ForEach-Object { $_.Current.Name })
+    Info "方案下拉项：$($schemeNames -join ' | ')"
+    if ($schemeNames -match '本工具方案') { Ok "方案下拉列出「本工具方案（own）」" } else { Bad "方案下拉没列出 own" }
+    if ($schemeNames -match 'gpt-instruct') { Ok "方案下拉列出「gpt-instruct 方案（protocol）」" } else { Bad "方案下拉没列出 protocol" }
+    $schemeCombo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Collapse()
+    Start-Sleep -Milliseconds 300
+  } catch { Bad "方案下拉展开失败：$($_.Exception.Message)" }
+} else { Bad "找不到方案下拉（ComboBox）" }
+$t = (Get-Texts $root) -join "`n"
+if ($t -match '该方案下此槽位不注入') { Ok "空槽逐条说明「该方案下此槽位不注入」" } else { Info "当前方案下没有空槽（或说明未渲染）" }
 
 [void](Select-Nav $root '验收台账')
 if (Click-Button $root '刷新台账') {

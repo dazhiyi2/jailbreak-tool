@@ -19,6 +19,7 @@ public partial class StatusPageViewModel(IAgentEngine engine) : PageViewModel(en
     [ObservableProperty] public partial IReadOnlyList<MarkerItem> Markers { get; set; } = Array.Empty<MarkerItem>();
     [ObservableProperty] public partial string Verdict { get; set; } = "暂无会话标记报告。";
     [ObservableProperty] public partial string MarkerSummary { get; set; } = "尚未检查";
+    [ObservableProperty] public partial string Scheme { get; set; } = "未提供（按 own 处理）";
 
     public override Task LoadAsync() => LoadAsync(async ct =>
     {
@@ -29,6 +30,8 @@ public partial class StatusPageViewModel(IAgentEngine engine) : PageViewModel(en
         Processes = result.ClientRunning ? "运行中 · 进程编号：" + string.Join("、", result.RunningProcessIds) : "客户端未运行";
         CheckedAt = Display.Time(result.CheckedAt);
         RestartRequired = result.RestartRequired;
+        var schemeNote = result.Notes.FirstOrDefault(n => n.Title == "注入方案");
+        Scheme = schemeNote is null ? "未提供（按 own 处理）" : schemeNote.Detail;
         Layers = result.Layers.Select(l => new LayerItem(l)).ToArray();
         SetNotes(result.Notes);
         SetReport(result.LastMarkerReport);

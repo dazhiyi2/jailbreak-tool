@@ -34,6 +34,8 @@ public sealed class ZcodeSelfTest : ITargetSelfTest
     {
         var r = new SelfTestResult { Name = Name };
         var saved = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        // 真实客户端的只读快照：自检全程只读（不写、不 touch），结束时变化项必须为 0。
+        var realSnapshot = DualScheme.CaptureReal("zcode");
 
         void SetEnv(string key, string? value)
         {
@@ -98,12 +100,14 @@ public sealed class ZcodeSelfTest : ITargetSelfTest
             Case10PayloadLayer(ctx, r, env);
             Case11LogsAndDiff(ctx, r, env);
             Case12RealInstallAnchorsReadOnly(ctx, r, env);
+            Case13DualScheme(ctx, r, SetEnv);
         }
         finally
         {
             foreach (var kv in saved) Environment.SetEnvironmentVariable(kv.Key, kv.Value);
         }
 
+        DualScheme.CheckRealReadOnly(r, "zcode", realSnapshot);
         return r;
     }
 
@@ -704,6 +708,121 @@ public sealed class ZcodeSelfTest : ITargetSelfTest
         }
 
         ctx.Log("real install + real log read-only cross-check ok");
+    }
+
+    // ================================================================ 13 双注入方案
+
+    /// <summary>own / protocol 双方案：独立沙箱，不依赖前面用例留下的状态。</summary>
+    private static void Case13DualScheme(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【13】双注入方案（own / protocol）：载体槽 payload、双向切换、幂等、revert、verbatim、fail-closed、标记");
+        DualScheme.Verbatim(r, "zcode");
+
+        var sandbox = ctx.MakeSandbox("zcode-scheme");
+        var installRoot = Path.Combine(sandbox, "install");
+        var bundlePath = Path.Combine(installRoot, "resources", "glm", "zcode.cjs");
+        var home = Path.Combine(sandbox, "home");
+        var dataDir = Path.Combine(sandbox, "data");
+        var memoryFile = Path.Combine(sandbox, "breach-zcode-path.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(bundlePath)!);
+        Directory.CreateDirectory(home);
+        Directory.CreateDirectory(dataDir);
+        FileText.Write(Path.Combine(installRoot, "ZCode.exe"), "MZ-dummy");
+        FileText.Write(bundlePath, BuildFixture());
+        var factorySha = FileText.Sha256File(bundlePath);
+
+        setEnv("ZCODE_HOME", home);
+        setEnv("ZCODE_ROOT", installRoot);
+        setEnv("ZCODE_BUNDLE", null);
+        setEnv("ZCODE_EXE", null);
+        setEnv("ZCODE_PATH_MEMORY_FILE", memoryFile);
+
+        var policy = new PolicyStore(dataDir);
+        policy.Materialize(ZcodeTarget.PolicyDefs);
+        var targetCtx = new TargetContext
+        {
+            Id = "zcode",
+            DataDir = dataDir,
+            Policy = policy,
+            PolicyDefs = ZcodeTarget.PolicyDefs,
+            Ledger = new LedgerStore(Path.Combine(dataDir, "probe-ledger.json")),
+        };
+        var target = new ZcodeTarget(targetCtx);
+        var agents = Path.Combine(home, "AGENTS.md");
+        var ownText = targetCtx.TextFor("payload", InjectionScheme.Own);
+
+        // 1 缺省 = own
+        DualScheme.SelectorMissingIsOwn(r, targetCtx, "zcode");
+        var ownApply = target.Apply(new ApplyOptions(), null, default);
+        r.Check(ownApply.Applied, "own 方案 apply 写入（回归）");
+        r.Check(FileText.Read(agents) == ownText, "own 方案把 A 套载荷写进 ~/.zcode/AGENTS.md");
+        var ownAgain = target.Apply(new ApplyOptions(), null, default);
+        r.Check(!ownAgain.Changes.Any(c => c.WillWrite), "own 方案连续两次 apply：WillWrite 全 false");
+
+        // 2 切 protocol：载体槽 = payload
+        DualScheme.SwitchToProtocol(r, targetCtx, "zcode", "payload");
+        r.Check(targetCtx.EmptySlotNames(InjectionScheme.Protocol).Count == 0, "zcode 的 protocol 方案没有空槽");
+
+        // 3 A → B：写入的唯一槽就是 B 套原文（逐字节）
+        var bApply = target.Apply(new ApplyOptions(), null, default);
+        r.Check(bApply.Applied, "A→B apply 报告已写入");
+        r.Check(FileText.Read(agents) == DualScheme.EmbeddedProtocol(), "B 套：AGENTS.md 逐字节等于 gpt-instruct 原文");
+        r.Check(FileText.Bytes(FileText.Read(agents)) == DualScheme.ProtocolBytes, $"B 套：AGENTS.md {DualScheme.ProtocolBytes} 字节");
+        r.Check(!FileText.Read(agents).Contains("工作约定", StringComparison.Ordinal), "B 套：A 套文本没有残留");
+        var bAgain = target.Apply(new ApplyOptions(), null, default);
+        r.Check(!bAgain.Changes.Any(c => c.WillWrite) && !bAgain.Applied, "B 方案连续两次 apply：无字节变化、WillWrite 全 false");
+
+        // 4 B → A：A 套全部恢复
+        targetCtx.Schemes().Write(InjectionScheme.Own);
+        var backA = target.Apply(new ApplyOptions(), null, default);
+        r.Check(backA.Applied, "B→A apply 报告已写入");
+        r.Check(FileText.Read(agents) == ownText, "切回 A：AGENTS.md 恢复为 A 套载荷");
+
+        // 5 从 B 方案 revert 回出厂态
+        targetCtx.Schemes().Write(InjectionScheme.Protocol);
+        target.Apply(new ApplyOptions(), null, default);
+        var rev = target.Revert(new RevertOptions(), null, default);
+        r.Check(rev.Reverted, "从 B 方案 revert 报告已还原");
+        r.Check(!FileText.Exists(agents), "revert 后 AGENTS.md 不存在（出厂态）");
+        r.Check(FileText.Sha256File(bundlePath) == factorySha, "revert 后宿主补丁层与出厂 fixture 逐字节一致");
+        r.Check(rev.ReadBackClean && rev.MatchesOriginal == true,
+            $"revert 回读干净且与首次备份一致（ReadBackClean={rev.ReadBackClean} / MatchesOriginal={rev.MatchesOriginal}）");
+
+        // 6 非法 scheme 值 → own + Note
+        DualScheme.InvalidValueFallsBackToOwn(r, targetCtx, "zcode");
+        FileText.Write(targetCtx.Policy.SchemePath, "bogus-value\n");
+        var st = target.GetStatus(default);
+        r.Check(st.Notes.Any(n => n.Title == "方案文件"), "状态页 Notes 说明方案文件非法（按 own 处理）");
+
+        // 7 fail-closed：B 套资源缺失（载荷文本拿不到 → 拒绝写入且不动 AGENTS.md）
+        var broken = new ZcodeTarget(DualScheme.BreakProtocolCarrier(targetCtx, "payload"));
+        broken.SavePolicyFile("scheme", "protocol", default);
+        FileText.Write(agents, ownText);              // 先放一份 A 套内容，确认 fail-closed 不会动它
+        var agentsSha = FileText.Sha256File(agents);
+        var threw = false;
+        try { broken.Apply(new ApplyOptions(), null, default); }
+        catch (AgentEngineException ex)
+        {
+            threw = true;
+            r.Check(ex.Code is EngineErrorCode.TargetFileMissing or EngineErrorCode.SelfCheckFailed or EngineErrorCode.VerifyProblems,
+                $"B 套资源缺失 → apply 抛 {ex.Code}");
+        }
+        r.Check(threw, "B 套资源缺失时 fail-closed（不是静默注空文本）");
+        r.Check(FileText.Sha256File(agents) == agentsSha, "fail-closed 时 AGENTS.md 一个字节都没写");
+        r.Check(FileText.Sha256File(bundlePath) == factorySha, "fail-closed 发生在写盘之前：宿主补丁层也没动");
+
+        // 8 标记：B 方案用 B 套载荷层标记
+        r.Check(ZcodeLogs.SpecsForScheme(InjectionScheme.Protocol)
+                .Any(s => s.Marker == "INJECTED REVISION ACTION" && s.Layer == MarkerLayer.ContextPayload),
+            "CheckMarkers 在 protocol 方案用 B 套载荷层标记集");
+        r.Check(ZcodeTarget.PayloadMarkersFor(InjectionScheme.Own).Contains("工作约定"), "own 方案仍用原载荷标记集");
+
+        // 9 状态 Notes 报当前方案
+        var target2 = new ZcodeTarget(targetCtx);
+        targetCtx.Schemes().Write(InjectionScheme.Protocol);
+        target2.Apply(new ApplyOptions(), null, default);
+        DualScheme.PropagatesToStatusNotes(r, target2.GetStatus(default), "zcode");
     }
 
     // ================================================================ 合成 fixture

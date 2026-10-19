@@ -40,8 +40,10 @@ public sealed class AgentPromptState
     public bool AgentExists { get; init; }
     public bool PromptPresent { get; init; }
     public bool PromptIsString { get; init; }
-    /// <summary>这一段文本是不是本工具写进去的（逐字节等于当前系统层文本，或含系统层标记）。</summary>
+    /// <summary>这一段文本是不是本工具写进去的（逐字节等于本次目标文本，或含本工具任一注入标记）。</summary>
     public bool PromptIsOurs { get; init; }
+    /// <summary>这一段文本是否**逐字节等于本次要写的文本**（幂等判据；切换方案时"是我们写的但属于另一套"不算当前）。</summary>
+    public bool PromptIsCurrent { get; init; }
     public long PromptBytes { get; init; }
     /// <summary>该 agent 下除 prompt 之外的字段数——这些字段必须原样保留。</summary>
     public int OtherFields { get; init; }
@@ -380,10 +382,21 @@ public static class OpencodeConfig
     /// 这段 prompt 是不是本工具写进去的：逐字节等于当前系统层文本，或含系统层标记之一。
     /// 判据放在这里而不是"凡是有 prompt 就当成我们的"——别人自己写的 prompt 不能被我方撤销掉。
     /// </summary>
+    /// <summary>
+    /// 盘上有几个 agent 的 prompt 是**本工具写的**（含另一套方案留下的）。
+    /// 与幂等判据（逐字节等于本次目标文本）分开：判断"装上了 / 有痕迹"用这个，判断"要不要重写"用 AppliedAgents。
+    /// </summary>
+    public static int OurPromptCount(string? text, string promptText)
+    {
+        if (text is null) return 0;
+        return PlanAgentPrompts(text, true, promptText).Agents.Count(s => s.PromptIsOurs);
+    }
+
     public static bool IsOurPrompt(string? value, string promptText) =>
         value is not null &&
         (string.Equals(value, promptText, StringComparison.Ordinal) ||
-         OpencodeMarkers.SystemLayerMarkers.Any(m => m.Length > 0 && value.Contains(m, StringComparison.Ordinal)));
+         SchemeMarkers.Union(OpencodeMarkers.SystemLayerMarkers)
+             .Any(m => m.Length > 0 && value.Contains(m, StringComparison.Ordinal)));
 
     /// <summary>
     /// 系统提示词层（<c>agent.&lt;名字&gt;.prompt</c>）的写入计划。**纯函数**：不碰磁盘。
@@ -496,12 +509,15 @@ public static class OpencodeConfig
                 PromptPresent = true,
                 PromptIsString = true,
                 PromptIsOurs = IsOurPrompt(promptTextValue, promptText),
+                PromptIsCurrent = string.Equals(promptTextValue, promptText, StringComparison.Ordinal),
                 PromptBytes = FileText.Bytes(promptTextValue),
                 OtherFields = otherFields,
             });
         }
 
-        var applied = states.Where(s => s.PromptIsOurs).Select(s => s.Name).ToArray();
+        // 幂等判据必须是「逐字节等于本次目标文本」：切换注入方案时，另一套方案写的 prompt 仍是我们写的，
+        // 但不能算"已是当前文本"，否则 B 方案永远覆盖不了 A 方案留下的 prompt。
+        var applied = states.Where(s => s.PromptIsCurrent).Select(s => s.Name).ToArray();
         if (problems.Count > 0)
         {
             return new AgentPromptEdit

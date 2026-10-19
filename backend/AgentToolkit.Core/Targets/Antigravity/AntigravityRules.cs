@@ -54,9 +54,10 @@ public static class AntigravityRules
     /// <summary>内嵌文档的硬上限：单个规则文件 24,000 字节（超出按行边界截断）。</summary>
     public const long PerFileCapBytes = 24_000;
 
-    /// <summary>这份文本是不是本工具写的（含任一注入标记）。</summary>
+    /// <summary>这份文本是不是本工具写的（含任一注入标记；B 套标记也算）。</summary>
     public static bool IsOurs(string? text) =>
-        text is not null && AntigravityMarkers.BackupMarkers.Any(m => FileText.Count(text, m) > 0);
+        text is not null && SchemeMarkers.Union(AntigravityMarkers.BackupMarkers)
+            .Any(m => FileText.Count(text, m) > 0);
 
     /// <summary>磁盘现有内容与将要写入的内容是否逐字节相同（幂等判据，全工具统一）。</summary>
     public static bool SameContent(string? existing, string text) =>

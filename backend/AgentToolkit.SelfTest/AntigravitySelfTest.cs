@@ -119,6 +119,8 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
         var geminiBefore = SnapshotTree(realGemini, skipWalIndexShm: true);
         var installBefore = SnapshotTree(realInstall);
         var shmBefore = WalIndexShmCount(realGemini);
+        // 真实客户端的只读快照（整个 ~/.gemini + 安装根）：自检结束时变化项必须为 0。
+        var realSnapshot = DualScheme.CaptureReal("antigravity");
         r.Step($"    快照：~/.gemini {geminiBefore.Count} 个文件（另有 {shmBefore} 个 *.db-shm 不参与比对）、安装根 {installBefore.Count} 个文件");
 
         try
@@ -134,6 +136,7 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
             Case09Effectiveness(ctx, r, SetEnv);
             Case11ProtoNegative(ctx, r, SetEnv);
             Case12LocateDiffExportProbes(ctx, r, SetEnv);
+            Case16DualScheme(ctx, r, SetEnv);
         }
         finally
         {
@@ -141,6 +144,7 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
         }
 
         Case10RealDataReadOnly(ctx, r, realConversations);
+        DualScheme.CheckRealReadOnly(r, "antigravity", realSnapshot);
 
         // 收尾：真实的 ~/.gemini 与安装目录必须一个字节都没变（自检全程只读它们）。
         var geminiAfter = SnapshotTree(realGemini, skipWalIndexShm: true);
@@ -888,6 +892,9 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
 
         // ---- 注入文本 ----
         var policy = e.Target.GetPolicyFiles(default);
+        var schemeEntry = policy.First(p => p.Name == "scheme");
+        r.Check(schemeEntry is { Text: "own", Editable: false }, $"方案选择器作为只读条目一并返回（Text={schemeEntry.Text}）");
+        policy = policy.Where(p => p.Name != "scheme").ToArray();
         r.Check(policy.Count == 2, $"注入文本两条：rules + payload（实际 {policy.Count}）");
         r.Check(policy.All(p => p.Text.Length > 0), "两条注入文本都物化到磁盘且非空");
         r.Check(policy.First(p => p.Name == "rules").Path.EndsWith("antigravity.rules.md", StringComparison.Ordinal),
@@ -1061,6 +1068,103 @@ public sealed class AntigravitySelfTest : ITargetSelfTest
             MemoryFile = memoryFile,
             Target = new AntigravityTarget(targetCtx),
         };
+    }
+
+    // ================================================================ 16 双注入方案
+
+    /// <summary>
+    /// own / protocol 双方案：载体槽 = rules（rules\AGENTS.md）；空槽 = payload（rules\JailbreakTool.md）。
+    /// A→B 要移除 A 套遗留的第二份规则；B→A 全部恢复；revert 回出厂态。
+    /// </summary>
+    private static void Case16DualScheme(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【16】双注入方案（own / protocol）：载体槽 rules、空槽 payload、双向切换、幂等、revert、verbatim、fail-closed、标记");
+        DualScheme.Verbatim(r, "antigravity");
+
+        var e = Setup(ctx, setEnv, "scheme", config: FactoryConfig, agents: null);
+
+        // 1 缺省 = own（回归）
+        DualScheme.SelectorMissingIsOwn(r, e.Target.Ctx, "antigravity");
+        var ownApply = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(ownApply.Applied, "own 方案 apply 写入（回归）");
+        var ownRules = e.Target.Ctx.TextFor("rules", InjectionScheme.Own);
+        var ownExtra = e.Target.Ctx.TextFor("payload", InjectionScheme.Own);
+        r.Check(FileText.Read(e.AgentsFile) == ownRules, "own 方案照旧把 A 套规则写进 rules\\AGENTS.md");
+        r.Check(FileText.Read(e.ExtraFile) == ownExtra, "own 方案照旧写第二份规则 rules\\JailbreakTool.md");
+        var ownAgain = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(!ownAgain.Changes.Any(c => c.WillWrite), "own 方案连续两次 apply：WillWrite 全 false");
+
+        // 2 切 protocol
+        DualScheme.SwitchToProtocol(r, e.Target.Ctx, "antigravity", "rules");
+        r.Check(e.Target.Ctx.EmptySlotNames(InjectionScheme.Protocol).Contains("payload"), "protocol 的空槽含 payload");
+
+        // 3 A → B
+        var bApply = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(bApply.Applied, "A→B apply 报告已写入");
+        r.Check(FileText.Read(e.AgentsFile) == DualScheme.EmbeddedProtocol(), "B 套：rules\\AGENTS.md 逐字节等于 gpt-instruct 原文");
+        r.Check(FileText.Bytes(FileText.Read(e.AgentsFile)) == DualScheme.ProtocolBytes, $"B 套：AGENTS.md {DualScheme.ProtocolBytes} 字节");
+        r.Check(!FileText.Read(e.AgentsFile).Contains("本机配置说明", StringComparison.Ordinal), "B 套：A 套文本没有残留");
+        r.Check(!File.Exists(e.ExtraFile), "B 套：A 套遗留的 rules\\JailbreakTool.md 被移除");
+        r.Check(bApply.Changes.Any(c => c.Path == e.ExtraFile && c.WillWrite && c.AfterBytes == 0),
+            "B 套：第二份规则的移除走 PlannedChange（WillWrite=true / AfterBytes=0）");
+        r.Check(!bApply.Changes.Any(c => c.Path == e.ExtraFile && c.WillWrite && c.AfterBytes > 0),
+            "B 套：空槽没有产生写入型计划变更");
+        var bAgain = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(!bAgain.Changes.Any(c => c.WillWrite) && !bAgain.Applied, "B 方案连续两次 apply：无字节变化、WillWrite 全 false");
+
+        // 4 B → A
+        e.Target.Ctx.Schemes().Write(InjectionScheme.Own);
+        var backA = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(backA.Applied, "B→A apply 报告已写入");
+        r.Check(FileText.Read(e.AgentsFile) == ownRules, "切回 A：rules\\AGENTS.md 恢复为 A 套规则");
+        r.Check(FileText.Read(e.ExtraFile) == ownExtra, "切回 A：rules\\JailbreakTool.md 恢复");
+
+        // 5 从 B 方案 revert 回出厂态
+        e.Target.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        e.Target.Apply(new ApplyOptions(), null, default);
+        var rev = e.Target.Revert(new RevertOptions(), null, default);
+        r.Check(rev.Reverted, "从 B 方案 revert 报告已还原");
+        r.Check(!File.Exists(e.AgentsFile), "revert 后 rules\\AGENTS.md 不存在（出厂态）");
+        r.Check(!File.Exists(e.ExtraFile), "revert 后 rules\\JailbreakTool.md 不存在（出厂态）");
+        r.Check(FileText.Read(e.ConfigFile) == FactoryConfig, "revert 后 config.json 逐字节回到出厂内容");
+        r.Check(rev.ReadBackClean && rev.MatchesOriginal == true,
+            $"revert 回读干净且与首次备份一致（ReadBackClean={rev.ReadBackClean} / MatchesOriginal={rev.MatchesOriginal}）");
+
+        // 6 非法 scheme 值 → own + Note
+        DualScheme.InvalidValueFallsBackToOwn(r, e.Target.Ctx, "antigravity");
+        FileText.Write(e.Target.Ctx.Policy.SchemePath, "bogus-value\n");
+        var st = e.Target.GetStatus(default);
+        r.Check(st.Notes.Any(n => n.Title == "方案文件"), "状态页 Notes 说明方案文件非法（按 own 处理）");
+
+        // 7 fail-closed：B 套载体资源缺失 → 规则文本为空 → 拒绝写入
+        e.Target.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        var broken = new AntigravityTarget(DualScheme.BreakProtocolCarrier(e.Target.Ctx, "rules"));
+        var agentsSha = FileText.Exists(e.AgentsFile) ? FileText.Sha256File(e.AgentsFile) : "(无)";
+        var configSha = FileText.Sha256File(e.ConfigFile);
+        var threw = false;
+        try { broken.Apply(new ApplyOptions(), null, default); }
+        catch (AgentEngineException ex)
+        {
+            threw = true;
+            r.Check(ex.Code is EngineErrorCode.SelfCheckFailed or EngineErrorCode.TargetFileMissing or EngineErrorCode.VerifyProblems,
+                $"B 套资源缺失 → apply 抛 {ex.Code}");
+        }
+        r.Check(threw, "B 套资源缺失时 fail-closed（不是静默注空文本）");
+        r.Check((FileText.Exists(e.AgentsFile) ? FileText.Sha256File(e.AgentsFile) : "(无)") == agentsSha, "fail-closed 时 rules\\AGENTS.md 一个字节都没写");
+        r.Check(FileText.Sha256File(e.ConfigFile) == configSha, "fail-closed 时 config.json 一个字节都没写");
+
+        // 8 标记：B 方案用 B 套规则层标记
+        r.Check(AntigravityMarkers.SpecsForScheme(InjectionScheme.Protocol)
+                .Any(s => s.Marker == "INJECTED REVISION ACTION" && s.Layer == MarkerLayer.SystemPrompt),
+            "CheckMarkers 在 protocol 方案用 B 套规则层标记集");
+        r.Check(AntigravityMarkers.SpecsForScheme(InjectionScheme.Own).All(s => s.Marker != "INJECTED REVISION ACTION"),
+            "own 方案仍用原标记集（未被替换）");
+
+        // 9 状态 Notes 报当前方案
+        var target2 = new AntigravityTarget(e.Target.Ctx);
+        target2.Apply(new ApplyOptions(), null, default);
+        DualScheme.PropagatesToStatusNotes(r, target2.GetStatus(default), "antigravity");
     }
 
     // ================================================================ 合成会话库

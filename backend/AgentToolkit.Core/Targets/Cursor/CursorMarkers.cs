@@ -67,7 +67,17 @@ public static class CursorMarkers
     public static int CountHits(string text, IReadOnlyList<string> markers) =>
         markers.Sum(m => FileText.Count(text, m));
 
-    /// <summary>这段文本是不是本工具写的（含任一注入标记）。</summary>
+    /// <summary>这段文本是不是本工具写的（含任一注入标记；B 套标记也算）。</summary>
     public static bool IsOurs(string? text) =>
-        text is not null && BackupMarkers.Any(m => FileText.Count(text, m) > 0);
+        text is not null && SchemeMarkers.Union(BackupMarkers)
+            .Any(m => FileText.Count(text, m) > 0);
+
+    /// <summary>
+    /// 按方案取标记规格：protocol 方案下个人规则层是 gpt-instruct 原文，
+    /// 载荷层（含个人规则）的标记必须换成 B 套标记（否则命中数判据永远 0，那是假结论）。
+    /// </summary>
+    public static IReadOnlyList<MarkerSpec> SpecsForScheme(InjectionScheme scheme) =>
+        scheme == InjectionScheme.Protocol
+            ? SchemeMarkers.ReplaceLayer(MarkerSpecs, MarkerLayer.ContextPayload, SchemeMarkers.Protocol)
+            : MarkerSpecs;
 }

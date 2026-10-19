@@ -98,15 +98,23 @@ public static class StatusBuilder
 
     public static IReadOnlyList<PolicyFileInfo> PolicyFiles(TargetContext ctx)
     {
-        var list = new List<PolicyFileInfo>();
-        foreach (var def in ctx.PolicyDefs)
+        // 方案选择器本身作为第一个只读条目返回（界面能显示、CLI 能切换）。
+        var scheme = ctx.ActiveScheme(out var schemeNote);
+        var list = new List<PolicyFileInfo> { SchemeEntry(ctx, scheme, schemeNote) };
+
+        foreach (var def in SchemeResolve.ForScheme(ctx.PolicyDefs, scheme))
         {
             var text = ctx.Policy.Read(def) ?? "";
             var bytes = FileText.Bytes(text);
             var notes = new List<Note>();
+            var emptySlot = !def.Required && string.IsNullOrWhiteSpace(text);
             if (def.CapBytes is long cap && bytes >= cap)
                 notes.Add(Notes.Error("超出体积上限", $"当前 {FileText.Human(bytes)}，上限 {FileText.Human(cap)}。", def.DisplayName));
-            if (!def.Editable) notes.Add(Notes.Info("只读", "该文本由补丁表固化，改它要改补丁表本身。", def.DisplayName));
+            if (emptySlot)
+                notes.Add(Notes.Info("该方案下此槽位不注入",
+                    "这是当前方案的空槽：不写文件、不产生计划变更；切换方案时会把本工具在另一套方案里遗留的文件移除。", def.DisplayName));
+            else if (!def.Editable)
+                notes.Add(Notes.Info("只读", "该文本由补丁表固化，改它要改补丁表本身。", def.DisplayName));
 
             list.Add(new PolicyFileInfo
             {
@@ -116,16 +124,66 @@ public static class StatusBuilder
                 Text = text,
                 SizeBytes = bytes,
                 CapBytes = def.CapBytes,
-                Editable = def.Editable,
+                Editable = def.Editable && !emptySlot,
                 Notes = notes,
             });
         }
         return list;
     }
 
+    /// <summary>方案选择器条目（保留名 scheme）。界面 / CLI / MultiTargetEngine 都靠它读当前方案。</summary>
+    public static PolicyFileInfo SchemeFile(TargetContext ctx)
+    {
+        var scheme = ctx.ActiveScheme(out var note);
+        return SchemeEntry(ctx, scheme, note);
+    }
+
+    private static PolicyFileInfo SchemeEntry(TargetContext ctx, InjectionScheme scheme, string? schemeNote)
+    {
+        var value = SchemeText.ValueOf(scheme);
+        var notes = new List<Note>
+        {
+            Notes.Info("注入方案",
+                $"当前 {SchemeText.Describe(scheme)}；切换用 SavePolicyFileAsync(\"scheme\", \"own\"|\"protocol\")。" +
+                $"该方案下不注入的槽位：{DescribeEmptySlots(ctx, scheme)}。",
+                ctx.Policy.SchemePath),
+        };
+        if (schemeNote is not null)
+            notes.Add(Notes.Warn("方案文件", schemeNote, ctx.Policy.SchemePath));
+
+        return new PolicyFileInfo
+        {
+            Name = SchemeText.EntryName,
+            DisplayName = SchemeText.DisplayName,
+            Path = ctx.Policy.SchemePath,
+            Text = value,
+            SizeBytes = FileText.Bytes(value),
+            CapBytes = null,
+            Editable = false,
+            Notes = notes,
+        };
+    }
+
+    public static string DescribeEmptySlots(TargetContext ctx, InjectionScheme scheme)
+    {
+        var names = SchemeResolve.EmptySlotNames(ctx, scheme);
+        return names.Count == 0 ? "（无）" : string.Join("、", names);
+    }
+
     public static PolicyFileInfo SavePolicy(TargetContext ctx, string name, string text)
     {
-        var def = ctx.Def(name) ?? throw new AgentEngineException(EngineErrorCode.TargetFileMissing, $"没有名为「{name}」的注入文本。");
+        if (string.Equals(name, SchemeText.EntryName, StringComparison.OrdinalIgnoreCase))
+        {
+            if (!SchemeText.TryParse(text, out var scheme))
+                throw new AgentEngineException(EngineErrorCode.VerifyProblems,
+                    $"「注入方案」只接受 own / protocol（收到「{(text ?? "").Trim()}」），拒绝保存。");
+            ctx.Schemes().Write(scheme);
+            return PolicyFiles(ctx).First(p => p.Name == SchemeText.EntryName);
+        }
+
+        var active = ctx.ActiveScheme();
+        var def = SchemeResolve.Pick(ctx.PolicyDefs, name, active)
+                  ?? throw new AgentEngineException(EngineErrorCode.TargetFileMissing, $"没有名为「{name}」的注入文本。");
         if (def.CapBytes is long cap && FileText.Bytes(text) >= cap)
             throw new AgentEngineException(EngineErrorCode.VerifyProblems,
                 $"「{def.DisplayName}」超出上限：{FileText.Human(FileText.Bytes(text))} / {FileText.Human(cap)}，拒绝保存。");

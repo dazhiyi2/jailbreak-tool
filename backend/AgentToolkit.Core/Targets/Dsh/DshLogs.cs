@@ -39,6 +39,15 @@ public static class DshMarkers
 
     public static IReadOnlyList<string> ContextPayloadMarkers { get; } =
         Specs.Where(s => s.Layer == MarkerLayer.ContextPayload).Select(s => s.Marker).ToArray();
+
+    /// <summary>
+    /// 按方案取标记规格：protocol 方案下系统层是 gpt-instruct 原文，
+    /// 系统层的标记必须换成 B 套标记（否则命中数判据永远 0，那是假结论）。
+    /// </summary>
+    public static IReadOnlyList<MarkerSpec> SpecsForScheme(InjectionScheme scheme) =>
+        scheme == InjectionScheme.Protocol
+            ? SchemeMarkers.ReplaceLayer(Specs, MarkerLayer.SystemPrompt, SchemeMarkers.Protocol)
+            : Specs;
 }
 
 /// <summary>
@@ -129,12 +138,16 @@ public static class DshSessions
     }
 
     // ---------------------------------------------------------------- 判读
-    public static MarkerReport Check(string home, string? idOrLatest, CancellationToken ct)
+    public static MarkerReport Check(string home, string? idOrLatest, CancellationToken ct) =>
+        Check(home, idOrLatest, DshMarkers.Specs, ct);
+
+    /// <summary>按方案用对应标记集（protocol → B 套系统层标记）。</summary>
+    public static MarkerReport Check(string home, string? idOrLatest, IReadOnlyList<MarkerSpec> specs, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var info = Require(home, idOrLatest);
         var text = Decode(info.Path);
-        return MarkerScanner.Scan(info.Id, text, DshMarkers.Specs);
+        return MarkerScanner.Scan(info.Id, text, specs);
     }
 
     public static SessionDetail Load(string home, string? idOrLatest, SessionLoadOptions options, CancellationToken ct)

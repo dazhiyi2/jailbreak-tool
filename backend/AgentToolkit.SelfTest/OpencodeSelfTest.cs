@@ -137,6 +137,9 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Step($"真实配置根（只读比对）：{realConfig}");
         r.Step($"真实会话库（只读比对）：{realDb}");
 
+        // 真实客户端的只读快照（双方案用例也要求全程只读：不写、不 touch）
+        var realSnapshot = DualScheme.CaptureReal("opencode");
+
         try
         {
             Case01FactoryState(ctx, r, SetEnv);
@@ -154,6 +157,7 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
             Case13SwitchOff(ctx, r, SetEnv);
             Case14SystemMarkers(ctx, r, SetEnv);
             Case15NoSessionUndecidable(ctx, r, SetEnv);
+            Case16DualScheme(ctx, r, SetEnv);
         }
         finally
         {
@@ -172,6 +176,7 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Check(realWalShaBefore == realWalShaAfter, $"真实 opencode.db-wal 的 sha256 不变（{Short(realWalShaAfter)}）");
         r.Step("    注：-shm 是 SQLite 的 wal-index 共享内存文件，只读连接可能触碰它，故不做 sha 断言。");
 
+        DualScheme.CheckRealReadOnly(r, "opencode", realSnapshot);
         return r;
     }
 
@@ -863,8 +868,8 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Check(probes.First(p => p.Id == "E").PassCriteria.Contains("reasoning", StringComparison.OrdinalIgnoreCase),
             "E 的判据指向 session_message 里的推理原文");
 
-        var policy = e.Target.GetPolicyFiles(default);
-        r.Check(policy.Count == 3, $"注入文本三条：instructions + payload + system（实际 {policy.Count}）");
+        var policy = e.Target.GetPolicyFiles(default).Where(p => p.Name != "scheme").ToArray();
+        r.Check(policy.Length == 3, $"注入文本三条：instructions + payload + system（实际 {policy.Length}）");
         r.Check(policy.All(p => p.Text.Length > 0), "三条注入文本都物化到磁盘且非空");
         r.Check(policy.First(p => p.Name == "instructions").Path == e.InstructionsPath,
             "instructions 文本的路径就是要写进 opencode.json 的那一个");
@@ -1351,6 +1356,119 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         CheckThrows(r, () => broken.Target.CheckMarkers("latest", default), EngineErrorCode.IoError,
             "库文件损坏 → 抛 IoError（「库坏了」不许被降级成「无法判定」）");
         ctx.Log("no-session undecidable ok");
+    }
+
+    // ================================================================ 16 双注入方案
+
+    private const string SchemeFactoryConfig = "{\"$schema\":\"https://opencode.ai/config.json\",\"theme\":\"dark\"}\n";
+
+    /// <summary>
+    /// own / protocol 双方案：载体槽 = system；空槽 = instructions + payload。
+    /// A→B 要摘除 A 套遗留的 instructions 路径与 AGENTS.md；B→A 全部恢复；revert 回出厂态。
+    /// </summary>
+    private static void Case16DualScheme(SelfTestContext ctx, SelfTestResult r, Action<string, string?> setEnv)
+    {
+        r.Step("");
+        r.Step("【16】双注入方案（own / protocol）：载体槽 system、空槽 instructions+payload、双向切换、幂等、revert、verbatim、fail-closed、标记");
+        DualScheme.Verbatim(r, "opencode");
+
+        var e = Setup(ctx, setEnv, "scheme", SchemeFactoryConfig, null);
+        using var db = MakeDb(e.DataHome, e.Target.Ctx.Policy.PathOf(OpencodeTarget.PolicyDefs.First(d => d.Name == "instructions")));
+
+        // 1 缺省 = own（回归）
+        DualScheme.SelectorMissingIsOwn(r, e.Target.Ctx, "opencode");
+        var ownApply = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(ownApply.Applied, "own 方案 apply 写入（回归）");
+        r.Check(OpencodeConfig.ContainsPath(FileText.Read(e.ConfigFile), e.InstructionsPath),
+            "own 方案照旧把本工具指令文件写进 instructions");
+        r.Check(File.Exists(e.AgentsFile), "own 方案照旧部署 AGENTS.md");
+        var ownSystem = e.Target.Ctx.TextFor("system", InjectionScheme.Own);
+        r.Check(FileText.Read(e.ConfigFile).Contains(ownSystem.Split('\n')[0], StringComparison.Ordinal),
+            "own 方案照旧写 agent.<名字>.prompt");
+        var ownAgain = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(!ownAgain.Changes.Any(c => c.WillWrite), "own 方案连续两次 apply：WillWrite 全 false");
+
+        // 2 切 protocol：载体槽 = system；空槽 = instructions + payload
+        DualScheme.SwitchToProtocol(r, e.Target.Ctx, "opencode", "system");
+        var protoEmpties = e.Target.Ctx.EmptySlotNames(InjectionScheme.Protocol);
+        r.Check(protoEmpties.Contains("instructions") && protoEmpties.Contains("payload"),
+            $"protocol 的空槽含 instructions 与 payload（实际 {string.Join("、", protoEmpties)}）");
+        var protoB = e.Target.Ctx.TextFor("system", InjectionScheme.Protocol);
+        r.Check(protoB == DualScheme.EmbeddedProtocol(), "载体槽 system 解析到 B 套原文（逐字节）");
+        r.Check(protoB.Length != e.Target.Ctx.TextFor("system", InjectionScheme.Own).Length ||
+                protoB != e.Target.Ctx.TextFor("system", InjectionScheme.Own),
+            "B 套文本与 A 套不同（否则下面的覆盖断言没有意义）");
+
+        // 3 A → B
+        var bApply = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(bApply.Applied, "A→B apply 报告已写入");
+        var configB = FileText.Read(e.ConfigFile);
+        r.Check(!OpencodeConfig.ContainsPath(configB, e.InstructionsPath), "B 套：A 套遗留的 instructions 条目被摘除");
+        r.Check(!File.Exists(e.AgentsFile), "B 套：A 套遗留的 AGENTS.md 被移除");
+        r.Check(configB.Contains("INJECTED REVISION ACTION", StringComparison.Ordinal), "B 套：opencode.json 里是 gpt-instruct 原文");
+        var probe = OpencodeConfig.PlanAgentPrompts(configB, true, DualScheme.EmbeddedProtocol());
+        r.Check(probe.AppliedAgents.Count == OpencodeConfig.TargetAgents.Count,
+            $"B 套：{probe.AppliedAgents.Count} 个 agent 的 prompt 逐字节等于原文");
+        r.Check(bApply.Changes.Any(c => c.Path == e.ConfigFile && c.WillWrite && c.AfterBytes > 0),
+            "B 套：opencode.json 的摘除也走 PlannedChange（WillWrite=true）");
+        r.Check(bApply.Changes.Any(c => c.Path == e.AgentsFile && c.WillWrite && c.AfterBytes == 0),
+            "B 套：AGENTS.md 移除走 PlannedChange（WillWrite=true / AfterBytes=0）");
+        r.Check(!bApply.Changes.Any(c => c.Path == e.AgentsFile && c.WillWrite && c.AfterBytes > 0),
+            "B 套：空槽没有产生写入型计划变更");
+        var bAgain = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(!bAgain.Changes.Any(c => c.WillWrite) && !bAgain.Applied, "B 方案连续两次 apply：无字节变化、WillWrite 全 false");
+
+        // 4 B → A
+        e.Target.Ctx.Schemes().Write(InjectionScheme.Own);
+        var backA = e.Target.Apply(new ApplyOptions(), null, default);
+        r.Check(backA.Applied, "B→A apply 报告已写入");
+        r.Check(OpencodeConfig.ContainsPath(FileText.Read(e.ConfigFile), e.InstructionsPath), "切回 A：instructions 条目恢复");
+        r.Check(File.Exists(e.AgentsFile), "切回 A：AGENTS.md 恢复");
+        r.Check(FileText.Read(e.ConfigFile).Contains(ownSystem.Split('\n')[0], StringComparison.Ordinal), "切回 A：agent prompt 回到 A 套文本");
+
+        // 5 从 B 方案 revert 回出厂态
+        e.Target.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        e.Target.Apply(new ApplyOptions(), null, default);
+        var rev = e.Target.Revert(new RevertOptions(), null, default);
+        r.Check(rev.Reverted, "从 B 方案 revert 报告已还原");
+        r.Check(FileText.Read(e.ConfigFile) == SchemeFactoryConfig, "revert 后 opencode.json 逐字节回到出厂内容");
+        r.Check(!File.Exists(e.AgentsFile), "revert 后 AGENTS.md 不存在（出厂态）");
+        r.Check(rev.ReadBackClean && rev.MatchesOriginal == true,
+            $"revert 回读干净且与首次备份一致（ReadBackClean={rev.ReadBackClean} / MatchesOriginal={rev.MatchesOriginal}）");
+
+        // 6 非法 scheme 值 → own + Note
+        DualScheme.InvalidValueFallsBackToOwn(r, e.Target.Ctx, "opencode");
+        FileText.Write(e.Target.Ctx.Policy.SchemePath, "bogus-value\n");
+        var st = e.Target.GetStatus(default);
+        r.Check(st.Notes.Any(n => n.Title == "方案文件"), "状态页 Notes 说明方案文件非法（按 own 处理）");
+
+        // 7 fail-closed：B 套载体资源缺失 → 在写任何文件之前拒绝
+        var broken = new OpencodeTarget(DualScheme.BreakProtocolCarrier(e.Target.Ctx, "system"));
+        broken.SavePolicyFile("scheme", "protocol", default);
+        broken.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        var configSha = FileText.Sha256File(e.ConfigFile);
+        var threw = false;
+        try { broken.Apply(new ApplyOptions(), null, default); }
+        catch (AgentEngineException ex)
+        {
+            threw = true;
+            r.Check(ex.Code is EngineErrorCode.TargetFileMissing or EngineErrorCode.SelfCheckFailed or EngineErrorCode.VerifyProblems,
+                $"B 套资源缺失 → apply 抛 {ex.Code}");
+        }
+        r.Check(threw, "B 套资源缺失时 fail-closed（不是静默注空文本）");
+        r.Check(FileText.Sha256File(e.ConfigFile) == configSha, "fail-closed 时 opencode.json 一个字节都没写");
+
+        // 8 标记：B 方案用 B 套系统层标记
+        r.Check(OpencodeMarkers.SpecsForScheme(InjectionScheme.Protocol)
+                .Any(s => s.Marker == "INJECTED REVISION ACTION" && s.Layer == MarkerLayer.SystemPrompt),
+            "CheckMarkers 在 protocol 方案用 B 套系统层标记集");
+        r.Check(OpencodeMarkers.SpecsForScheme(InjectionScheme.Own).All(s => s.Marker != "INJECTED REVISION ACTION"),
+            "own 方案仍用原标记集（未被替换）");
+
+        // 9 状态 Notes 报当前方案
+        e.Target.Ctx.Schemes().Write(InjectionScheme.Protocol);
+        e.Target.Apply(new ApplyOptions(), null, default);
+        DualScheme.PropagatesToStatusNotes(r, e.Target.GetStatus(default), "opencode");
     }
 
     // ================================================================ 10 真实数据（只读）

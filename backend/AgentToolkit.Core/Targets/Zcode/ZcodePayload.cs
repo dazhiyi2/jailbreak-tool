@@ -67,7 +67,8 @@ public static class ZcodePayload
     public static bool NeedsWrite(string home, string payloadText) =>
         !ContentEqual(FileText.ReadOrNull(TargetOf(home)), payloadText);
 
-    public static ZcodePayloadResult Install(string home, string payloadText, bool dryRun)
+    public static ZcodePayloadResult Install(string home, string payloadText, bool dryRun,
+        IReadOnlyList<string>? ownershipMarkers = null)
     {
         var res = new ZcodePayloadResult
         {
@@ -103,10 +104,15 @@ public static class ZcodePayload
         {
             if (existing is not null && existing.Trim() != payloadText.Trim())
             {
-                if (feature.Length > 0 && existing.Contains(feature, StringComparison.Ordinal))
+                // 归属判定：首行优先；切换方案时另一套方案的文本也必须是"自家的"，
+                // 否则会把本工具自己写的东西备份成"用户原文件"（那会让 revert 还原出一份注入文本）。
+                var isOurs = (feature.Length > 0 && existing.Contains(feature, StringComparison.Ordinal)) ||
+                             (ownershipMarkers is not null &&
+                              ownershipMarkers.Any(m => !string.IsNullOrEmpty(m) && existing.Contains(m, StringComparison.Ordinal)));
+                if (isOurs)
                 {
-                    res.Notes.Add(Notes.Info("已存在的 AGENTS.md 是自家旧版载荷，不为它建备份",
-                        "按载荷首行判定归属：首行相同即视为本工具此前部署的版本，不覆盖备份。", "zcode/payload"));
+                    res.Notes.Add(Notes.Info("已存在的 AGENTS.md 是自家载荷，不为它建备份",
+                        "按载荷首行/注入标记判定归属：是自家此前部署的版本（可能来自另一套方案），不覆盖备份。", "zcode/payload"));
                 }
                 else
                 {
@@ -128,7 +134,8 @@ public static class ZcodePayload
         return res;
     }
 
-    public static ZcodePayloadResult Revert(string home, string? payloadText, bool dryRun)
+    public static ZcodePayloadResult Revert(string home, string? payloadText, bool dryRun,
+        IReadOnlyList<string>? ownershipMarkers = null)
     {
         var res = new ZcodePayloadResult
         {
@@ -139,7 +146,11 @@ public static class ZcodePayload
         var body = payloadText ?? "";
         var feature = body.Length > 0 ? FeatureOf(body) : "";
         var existing = FileText.ReadOrNull(res.TargetPath);
-        var isOurs = existing is not null && feature.Length > 0 && existing.Contains(feature, StringComparison.Ordinal);
+        // 归属：首行（本方案）或任一注入标记（另一套方案留下的自家文件）。
+        var isOurs = existing is not null &&
+                     ((feature.Length > 0 && existing.Contains(feature, StringComparison.Ordinal)) ||
+                      (ownershipMarkers is not null &&
+                       ownershipMarkers.Any(m => !string.IsNullOrEmpty(m) && existing.Contains(m, StringComparison.Ordinal))));
         res.BeforeBytes = existing is null ? 0 : FileText.Bytes(existing);
 
         if (File.Exists(res.BackupPath))

@@ -57,6 +57,7 @@ public sealed class OpencodeTarget : ITargetAdapter
 
     public static IReadOnlyList<PolicyTextDef> PolicyDefs { get; } = new[]
     {
+        // ---- A 套（own）：现有注入文本，一个字未改 ----
         new PolicyTextDef { Name = "instructions", DisplayName = "配置指令（opencode.json → instructions）", FileName = "opencode-instructions.md", ResourceSuffix = "opencode.instructions.md" },
         new PolicyTextDef { Name = "payload", DisplayName = "上下文载荷（AGENTS.md）", FileName = "AGENTS.md", ResourceSuffix = "opencode.payload.md" },
         // Required=false 是这一层的开关：契约的 ApplyOptions / RevertOptions 没有第三个层开关，
@@ -69,7 +70,42 @@ public sealed class OpencodeTarget : ITargetAdapter
             ResourceSuffix = "opencode.system.md",
             Required = false,
         },
+
+        // ---- B 套（protocol）：载体槽 = system，放 gpt-instruct 原文（逐字节）；
+        //      instructions / payload 是空槽：不写文件、不产生计划变更，切换时摘除 A 套遗留。
+        new PolicyTextDef
+        {
+            Name = "instructions",
+            DisplayName = "配置指令（protocol 方案下为空槽：不注入）",
+            FileName = "opencode-instructions.schemeB.md",
+            ResourceSuffix = SchemeBEmptySuffix,
+            Required = false,
+            Editable = false,
+            Scheme = InjectionScheme.Protocol,
+        },
+        new PolicyTextDef
+        {
+            Name = "payload",
+            DisplayName = "上下文载荷（protocol 方案下为空槽：不注入）",
+            FileName = "AGENTS.schemeB.md",
+            ResourceSuffix = SchemeBEmptySuffix,
+            Required = false,
+            Editable = false,
+            Scheme = InjectionScheme.Protocol,
+        },
+        new PolicyTextDef
+        {
+            Name = SystemPolicyName,
+            DisplayName = "系统提示词（opencode.json → agent.<名字>.prompt）· gpt-instruct 原文",
+            FileName = "opencode.system.schemeB.md",
+            ResourceSuffix = SchemeBProtocolSuffix,
+            Required = false,
+            Scheme = InjectionScheme.Protocol,
+        },
     };
+
+    private const string SchemeBProtocolSuffix = "schemeB.protocol.md";
+    private const string SchemeBEmptySuffix = "schemeB.empty.md";
 
     /// <summary>
     /// 系统提示词层（层 3）的开关与文本。
@@ -83,13 +119,20 @@ public sealed class OpencodeTarget : ITargetAdapter
     /// </summary>
     private (bool Enabled, string Text) SystemLayerText()
     {
-        var def = Ctx.Def(SystemPolicyName);
+        var def = Ctx.DefFor(SystemPolicyName, Ctx.ActiveScheme());
         if (def is null) return (false, "");
         string text;
         try { text = Ctx.Policy.Read(def) ?? ""; }
         catch { return (false, ""); }
         return (text.Trim().Length > 0, text);
     }
+
+    private Note SchemeNote(InjectionScheme scheme) => Notes.Info("注入方案",
+        scheme == InjectionScheme.Protocol
+            ? "当前 protocol（gpt-instruct 原文，逐字节不动）；载体槽 = system（opencode.json 的 agent.<名字>.prompt）；" +
+              "空槽 = instructions、payload（不注入；A 套遗留的 instructions 条目与 AGENTS.md 由 apply 摘除）。"
+            : "当前 own（本工具方案）；三层都注入：instructions / payload / system。",
+        Ctx.Policy.SchemePath);
 
     // ================================================================ 定位 / 描述
 
@@ -154,10 +197,12 @@ public sealed class OpencodeTarget : ITargetAdapter
         ProfileDir: loc.ConfigHome,
         RunningProcessIds: PathProbe.ProcessIds(OpencodeLocator.ProcessName));
 
-    /// <summary>本工具管理的指令文件的绝对路径（写进 opencode.json 的 instructions）。</summary>
+    /// <summary>本工具管理的指令文件的绝对路径（写进 opencode.json 的 instructions）。
+    /// 注意：这个路径**永远取 own 套的定义**——opencode.json 里可能出现的就是它；
+    /// protocol 方案下 instructions 是空槽，apply 要做的是把这个路径摘掉。</summary>
     private string InstructionsPath()
     {
-        var def = Ctx.Def("instructions")
+        var def = Ctx.DefFor("instructions", InjectionScheme.Own)
                   ?? throw new AgentEngineException(EngineErrorCode.Unsupported, "没有名为「instructions」的注入文本定义。");
         return Ctx.Policy.PathOf(def);
     }
@@ -165,7 +210,7 @@ public sealed class OpencodeTarget : ITargetAdapter
     /// <summary>系统提示词层注入文本的落盘路径（写进 opencode.json 的 agent.&lt;名字&gt;.prompt 的那一份）。</summary>
     private string SystemTextPath()
     {
-        var def = Ctx.Def(SystemPolicyName);
+        var def = Ctx.DefFor(SystemPolicyName, Ctx.ActiveScheme());
         return def is null ? "(没有名为 system 的注入文本定义)" : Ctx.Policy.PathOf(def);
     }
 
@@ -180,6 +225,11 @@ public sealed class OpencodeTarget : ITargetAdapter
         var configFile = loc.ConfigFile;
         var agentsFile = loc.AgentsFile;
         var instrPath = InstructionsPath();
+        var scheme = Ctx.ActiveScheme(out var schemeNote);
+        if (schemeNote is not null) notes.Add(Notes.Warn("方案文件", schemeNote, Ctx.Policy.SchemePath));
+        notes.Add(SchemeNote(scheme));
+        var instrEmptySlot = Ctx.IsEmptySlot("instructions", scheme);
+        var payloadEmptySlot = Ctx.IsEmptySlot("payload", scheme);
 
         var sessions = ListSessions(ct);
         MarkerReport? last = null;
@@ -200,19 +250,22 @@ public sealed class OpencodeTarget : ITargetAdapter
                 loc.DbPath));
         }
 
-        var layer1 = InstructionsLayer(configFile, instrPath, loc);
-        var layer2 = PayloadLayer(agentsFile);
+        var layer1 = InstructionsLayer(configFile, instrPath, loc, scheme, instrEmptySlot);
+        var layer2 = PayloadLayer(agentsFile, scheme, payloadEmptySlot);
         var (systemEnabled, systemText) = SystemLayerText();
-        var layer3 = AgentPromptLayer(configFile, systemEnabled, systemText, SystemTextPath());
+        var layer3 = AgentPromptLayer(configFile, systemEnabled, systemText, SystemTextPath(), scheme);
 
         var configApplied = layer1.State == LayerState.Applied;
         var payloadApplied = layer2.State == LayerState.Applied;
         var agentApplied = layer3.State == LayerState.Applied;
-        ApplyEffectiveness(layer1, "配置指令层", OpencodeMarkers.InstructionsMarkers, scopedBlobText, newestId,
+        var instrMarkers = SchemeMarkers.ForLayer(scheme, OpencodeMarkers.InstructionsMarkers);
+        var payloadMarkers = SchemeMarkers.ForLayer(scheme, OpencodeMarkers.PayloadMarkers);
+        var systemMarkers = SchemeMarkers.ForLayer(scheme, OpencodeMarkers.SystemLayerMarkers);
+        ApplyEffectiveness(layer1, "配置指令层", instrMarkers, scopedBlobText, newestId,
             bothInstalled: configApplied && payloadApplied, notes);
-        ApplyEffectiveness(layer2, "上下文载荷层", OpencodeMarkers.PayloadMarkers, scopedBlobText, newestId,
+        ApplyEffectiveness(layer2, "上下文载荷层", payloadMarkers, scopedBlobText, newestId,
             bothInstalled: payloadApplied, notes);
-        ApplyEffectiveness(layer3, "系统提示词层", OpencodeMarkers.SystemLayerMarkers, scopedBlobText, newestId,
+        ApplyEffectiveness(layer3, "系统提示词层", systemMarkers, scopedBlobText, newestId,
             bothInstalled: agentApplied, notes);
         if (layer3.InstalledButNotEffective)
             layer3.EffectivenessEvidence +=
@@ -237,9 +290,9 @@ public sealed class OpencodeTarget : ITargetAdapter
         // 常驻指令在**会话启动时**装配：已存在的会话不会重读 → 盘上是注入态而最近会话里读不到时，必须开新会话。
         var applied = configApplied || payloadApplied || agentApplied;
         var effective = scopedBlobText is not null &&
-                        (OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.InstructionsMarkers) > 0 ||
-                         OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.PayloadMarkers) > 0 ||
-                         OpencodeMarkers.CountHits(scopedBlobText, OpencodeMarkers.SystemLayerMarkers) > 0);
+                        (OpencodeMarkers.CountHits(scopedBlobText, instrMarkers) > 0 ||
+                         OpencodeMarkers.CountHits(scopedBlobText, payloadMarkers) > 0 ||
+                         OpencodeMarkers.CountHits(scopedBlobText, systemMarkers) > 0);
         var restart = applied && !effective;
         if (restart && running)
             notes.Add(Notes.Warn("需要新会话",
@@ -271,18 +324,26 @@ public sealed class OpencodeTarget : ITargetAdapter
     ///   markerHits=1（路径在位）→ Applied；否则 anchorHits=1（文件是能安全改写的合法 JSON 对象）→ NotApplied；
     ///   anchorHits=0（解析不了 / instructions 类型不对）→ AnchorMissing，apply 会 fail-closed 拒写。
     /// </summary>
-    private LayerStatus InstructionsLayer(string configFile, string instrPath, OpencodeLocation loc)
+    private LayerStatus InstructionsLayer(string configFile, string instrPath, OpencodeLocation loc,
+        InjectionScheme scheme, bool emptySlot)
     {
+        var markers = SchemeMarkers.ForLayer(scheme, OpencodeMarkers.InstructionsMarkers);
         var layer = StatusBuilder.BuildLayer(
             LayerKind.PolicyText,
             "配置指令层（opencode.json → instructions）",
             configFile,
             null,
-            OpencodeMarkers.InstructionsMarkers,
+            markers,
             OpencodeConfig.TryParseObject,
-            absentDetail: $"opencode.json 不存在：首次 apply 会创建它（{{\"$schema\":\"{OpencodeConfig.SchemaUrl}\",\"instructions\":[<本工具指令文件>]}}）。",
-            appliedDetail: "instructions 数组里含本工具管理的指令文件路径。",
-            notAppliedDetail: "opencode.json 里没有本工具的 instructions 条目。");
+            absentDetail: emptySlot
+                ? $"opencode.json 不存在：protocol 方案的 instructions 是空槽，不创建配置。"
+                : $"opencode.json 不存在：首次 apply 会创建它（{{\"$schema\":\"{OpencodeConfig.SchemaUrl}\",\"instructions\":[<本工具指令文件>]}}）。",
+            appliedDetail: emptySlot
+                ? "instructions 里仍有本工具的指令文件路径（另一套方案的遗留）。"
+                : "instructions 数组里含本工具管理的指令文件路径。",
+            notAppliedDetail: emptySlot
+                ? "protocol 方案的 instructions 是空槽：本层不注入。"
+                : "opencode.json 里没有本工具的 instructions 条目。");
 
         if (layer.State == LayerState.TargetAbsent)
         {
@@ -299,7 +360,14 @@ public sealed class OpencodeTarget : ITargetAdapter
 
         StatusBuilder.WithAnchorState(layer,
             anchorHits: parseOk && edit.Problems.Count == 0 ? 1 : 0,
-            markerHits: pathPresent ? 1 : 0);
+            markerHits: emptySlot ? 0 : (pathPresent ? 1 : 0));
+
+        if (emptySlot && layer.State == LayerState.NotApplied)
+        {
+            layer.StateDetail = pathPresent
+                ? "protocol 方案的 instructions 是空槽：本层不注入；盘上仍有本工具的路径，apply 会摘除它。"
+                : "protocol 方案的 instructions 是空槽：本层不注入（盘上也没有本工具的路径）。";
+        }
 
         if (!parseOk || edit.Problems.Count > 0)
         {
@@ -320,13 +388,20 @@ public sealed class OpencodeTarget : ITargetAdapter
             var others = edit.Entries.Where(e => !string.Equals(e, instrPath, StringComparison.OrdinalIgnoreCase)).ToArray();
             if (others.Length > 0) extra.Add(Notes.Info("还有其它 instructions", string.Join("；", others), configFile));
         }
+        else if (emptySlot)
+        {
+            extra.Add(Notes.Info("将摘除遗留路径", pathPresent ? instrPath : "（盘上没有本工具的路径）", configFile));
+        }
         else if (layer.State is LayerState.NotApplied or LayerState.Applied)
         {
             extra.Add(Notes.Info("将由 apply 加入", instrPath, configFile));
         }
 
         var instrText = SafeInstructionsText();
-        if (string.IsNullOrWhiteSpace(instrText))
+        if (emptySlot)
+            extra.Add(Notes.Info("空槽",
+                $"protocol 方案的 instructions 是空槽：不注入指令文件；盘上若仍有本工具的路径（{instrPath}），apply 会摘除它。", configFile));
+        else if (string.IsNullOrWhiteSpace(instrText))
             extra.Add(Notes.Error("指令文件为空", $"注入文本为空：{instrPath}（apply 会 fail-closed 拒绝把配置指向空文件）。", instrPath));
         else
             extra.Add(Notes.Info("指令文件",
@@ -349,14 +424,16 @@ public sealed class OpencodeTarget : ITargetAdapter
     /// 解析不了 / agent 不是对象 / 某个 agent 不是对象 / prompt 存在但不是字符串 → AnchorMissing，
     /// apply 会 fail-closed 拒写（与层 1 同口径）。
     /// </summary>
-    private static LayerStatus AgentPromptLayer(string configFile, bool enabled, string systemText, string systemTextPath)
+    private static LayerStatus AgentPromptLayer(string configFile, bool enabled, string systemText, string systemTextPath,
+        InjectionScheme scheme)
     {
+        var markers = SchemeMarkers.ForLayer(scheme, OpencodeMarkers.SystemLayerMarkers);
         var layer = StatusBuilder.BuildLayer(
             LayerKind.PolicyText,
             "系统提示词层（opencode.json → agent.<名字>.prompt）",
             configFile,
             null,
-            OpencodeMarkers.SystemLayerMarkers,
+            markers,
             OpencodeConfig.TryParseObject,
             absentDetail: "opencode.json 不存在：系统提示词层未部署（首次 apply 会创建它）。",
             appliedDetail: "四个 agent 的 prompt 都是本工具的系统层文本。",
@@ -372,11 +449,12 @@ public sealed class OpencodeTarget : ITargetAdapter
         var text = FileText.ReadOrNull(configFile) ?? "";
         var edit = OpencodeConfig.PlanAgentPrompts(text, true, systemText);
         var parseOk = layer.ParseOk && edit.ParseOk;
-        var applied = edit.AppliedAgents;
+        // 「装上了」看痕迹（本工具写的，含另一套方案）；「要不要重写」才看是否逐字节等于本次目标文本。
+        var ours = edit.Agents.Where(s => s.PromptIsOurs).Select(s => s.Name).ToArray();
 
         StatusBuilder.WithAnchorState(layer,
             anchorHits: parseOk && edit.Problems.Count == 0 ? 1 : 0,
-            markerHits: applied.Count == OpencodeConfig.TargetAgents.Count ? 1 : 0);
+            markerHits: ours.Length == OpencodeConfig.TargetAgents.Count ? 1 : 0);
 
         if (!parseOk || edit.Problems.Count > 0)
         {
@@ -392,10 +470,10 @@ public sealed class OpencodeTarget : ITargetAdapter
         {
             layer.StateDetail = !enabled
                 ? "系统提示词层未启用（该层注入文本为空或定义缺失）：本层不参与 apply；revert 仍会清掉盘上确实由本工具写入的 prompt。"
-                : applied.Count == 0
+                : ours.Length == 0
                     ? "opencode.json 里没有本工具的系统层 prompt。"
-                    : $"系统提示词层没写全：{applied.Count}/{OpencodeConfig.TargetAgents.Count} 个 agent 带本工具文本" +
-                      $"（{string.Join("、", applied)}）；apply 会把 {string.Join("、", OpencodeConfig.TargetAgents)} 四个都写上。";
+                    : $"系统提示词层没写全：{ours.Length}/{OpencodeConfig.TargetAgents.Count} 个 agent 带本工具文本" +
+                      $"（{string.Join("、", ours)}）；apply 会把 {string.Join("、", OpencodeConfig.TargetAgents)} 四个都写上。";
         }
         else if (!enabled)
         {
@@ -435,31 +513,45 @@ public sealed class OpencodeTarget : ITargetAdapter
             extra.Add(Notes.Warn("系统层文本为空",
                 $"{systemTextPath} 为空或缺失：apply 不会写 agent prompt。填回文本后本层自动启用。", systemTextPath));
 
+        extra.Add(Notes.Info("注入方案",
+            scheme == InjectionScheme.Protocol
+                ? "protocol 方案：本层是载体槽，写入的是 gpt-instruct 原文（逐字节）；命中判据用 B 套标记。"
+                : "own 方案：本层写入的是本工具的注入文本；命中判据用自有标记。", configFile));
+
         layer.Notes = layer.Notes.Concat(extra).ToArray();
         return layer;
     }
 
-    private static LayerStatus PayloadLayer(string agentsFile)
+    private static LayerStatus PayloadLayer(string agentsFile, InjectionScheme scheme, bool emptySlot)
     {
+        var markers = SchemeMarkers.ForLayer(scheme, OpencodeMarkers.PayloadMarkers);
         var layer = StatusBuilder.BuildLayer(
             LayerKind.ContextPayload,
             "上下文载荷层（<config>/AGENTS.md）",
             agentsFile,
             null,
-            OpencodeMarkers.PayloadMarkers,
+            markers,
             parseOk: null,
-            absentDetail: "AGENTS.md 不存在：载荷层未部署。",
-            appliedDetail: "AGENTS.md 存在且含载荷标记（本工具部署的全局指令文件）。",
-            notAppliedDetail: "AGENTS.md 存在，但内容不是本工具的载荷（用户自己的文件，apply 会先备份）。");
+            absentDetail: emptySlot
+                ? "protocol 方案下 payload 是空槽：不写 AGENTS.md（A 套遗留的会被 apply 移除）。"
+                : "AGENTS.md 不存在：载荷层未部署。",
+            appliedDetail: "AGENTS.md 存在且含当前方案的载荷标记（本工具部署的全局指令文件）。",
+            notAppliedDetail: emptySlot
+                ? "AGENTS.md 存在，但 protocol 方案的 payload 是空槽：本层不注入；现有文件不是本工具的就一律不动。"
+                : "AGENTS.md 存在，但内容不是本工具的载荷（用户自己的文件，apply 会先备份）。");
 
         if (layer.State == LayerState.TargetAbsent) return layer;
 
-        layer.Notes = layer.Notes.Concat(new[]
+        var notes = new List<Note>
         {
             Notes.Info("项目级同名文件",
                 "opencode 还会从工作目录向上搜到项目根、逐级加载 AGENTS.md（ConfigInstructionPlugin 的 X5(T,C) 逻辑）；" +
                 "全局这一份是主注入点，也是本工具唯一管理的那一份。", agentsFile),
-        }).ToArray();
+        };
+        if (emptySlot)
+            notes.Add(Notes.Info("注入方案",
+                "protocol 方案：payload 是空槽（不注入）；含本工具标记的遗留文件会被 apply 移除，别人的文件一律不动。", agentsFile));
+        layer.Notes = layer.Notes.Concat(notes).ToArray();
         return layer;
     }
 
@@ -519,7 +611,7 @@ public sealed class OpencodeTarget : ITargetAdapter
 
     private string SafeInstructionsText()
     {
-        var def = Ctx.Def("instructions");
+        var def = Ctx.DefFor("instructions", Ctx.ActiveScheme());
         if (def is null) return "";
         try { return Ctx.Policy.Read(def) ?? ""; }
         catch { return ""; }
@@ -534,6 +626,10 @@ public sealed class OpencodeTarget : ITargetAdapter
         public required string InstructionsPath { get; init; }
         public required InstructionsEdit Edit { get; init; }
         public required OpencodePayloadPlan Payload { get; init; }
+        /// <summary>空槽清理计划（protocol 方案下 payload 为空槽时，移除 A 套遗留的 AGENTS.md）。</summary>
+        public SlotRemovalPlan? PayloadRemoval { get; init; }
+        /// <summary>protocol 方案下 instructions 是空槽（不注入，只摘除 A 套遗留的路径）。</summary>
+        public bool InstrEmptySlot { get; init; }
         /// <summary>层 3（系统提示词层）：同一份 opencode.json 的 agent.&lt;名字&gt;.prompt。</summary>
         public required AgentPromptEdit Agents { get; init; }
         /// <summary>层 3 的注入文本（值级前后对照与撤销归属判据都要用它）。</summary>
@@ -573,6 +669,9 @@ public sealed class OpencodeTarget : ITargetAdapter
                     layerNotes.Add(Notes.Info("同一份文件的另一处改动",
                         "系统提示词层也在改这份 opencode.json（agent.<名字>.prompt）：本条目只报 instructions 这一段，" +
                         "整份文件的最终形态见系统提示词层条目。", ConfigFile));
+                if (InstrEmptySlot)
+                    layerNotes.Add(Notes.Info("空槽",
+                        "protocol 方案的 instructions 是空槽：不注入指令文件；这一条计划只负责摘除 A 套遗留的路径。", ConfigFile));
                 list.Add(new PlannedChange
                 {
                     Path = ConfigFile,
@@ -631,7 +730,12 @@ public sealed class OpencodeTarget : ITargetAdapter
                 });
             }
 
-            if (PayloadLayer)
+            if (PayloadRemoval is not null)
+            {
+                var change = SchemeSlotFile.Change(PayloadRemoval, LayerKind.ContextPayload, "protocol 方案的 payload 空槽");
+                if (change is not null) list.Add(change);
+            }
+            else if (PayloadLayer)
             {
                 var (pDiff, _, _) = Payload.WillWrite
                     ? DiffBuilder.Build(Payload.Existing ?? "", Payload.Text)
@@ -659,30 +763,62 @@ public sealed class OpencodeTarget : ITargetAdapter
         var loc = Peek(ct);
         var configFile = loc.ConfigFile;
         var problems = new List<string>();
+        var scheme = Ctx.ActiveScheme(out _);
 
         var instrPath = InstructionsPath();
         var instrText = SafeInstructionsText();
-        if (string.IsNullOrWhiteSpace(instrText))
-            problems.Add($"「配置指令」文本为空：{instrPath}（拒绝把配置指向一个空文件）。");
+        var instrEmptySlot = Ctx.IsEmptySlot("instructions", scheme);
 
         var (systemEnabled, systemText) = SystemLayerText();
+        // fail-closed：protocol 方案的载体槽必须拿得到原文（该层 Required=false 是"层开关"，
+        // 不能把"资源缺失"与"用户清空"混为一谈——前者是工具自身资产坏了，必须拒绝写入）。
+        if (scheme == InjectionScheme.Protocol)
+        {
+            var carrier = Ctx.DefFor(SystemPolicyName, InjectionScheme.Protocol);
+            if (carrier is null)
+                problems.Add("protocol 方案的载体槽定义缺失（system）：拒绝写入。");
+            else if (Ctx.Policy.Read(carrier) is null)
+                problems.Add($"protocol 方案的载体文本不存在：{Ctx.Policy.PathOf(carrier)}（B 套内嵌资源缺失，拒绝写入）。");
+        }
 
         var origin = FileText.ReadOrNull(configFile);
-        var edit = OpencodeConfig.Plan(origin, File.Exists(configFile), instrPath);
-        problems.AddRange(edit.Problems);
+        var fileExists = File.Exists(configFile);
+
+        InstructionsEdit edit;
+        if (instrEmptySlot)
+        {
+            // 空槽：不写指令文件、不往 opencode.json 里加路径；要做的是摘除 A 套遗留的路径。
+            edit = PlanEmptyInstructions(configFile, origin, fileExists, instrPath);
+            problems.AddRange(edit.Problems);
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(instrText))
+                problems.Add($"「配置指令」文本为空：{instrPath}（拒绝把配置指向一个空文件）。");
+            edit = OpencodeConfig.Plan(origin, fileExists, instrPath);
+            problems.AddRange(edit.Problems);
+        }
 
         // 层 3 的起点是「层 1 改写之后」的文档（层 1 被跳过时就是当前文档），两份计划因此不会互相覆盖。
-        var baseExists = File.Exists(configFile) || (!options.SkipSystemPrompt && edit.WillWrite);
+        var baseExists = fileExists || (!options.SkipSystemPrompt && edit.WillWrite);
         var agentsBase = options.SkipSystemPrompt ? (origin ?? "") : edit.Next;
         var agents = OpencodeConfig.PlanAgentPrompts(agentsBase, baseExists, systemText);
         // 本层未启用时（文本为空）它的 Problems 不该把整个 apply 拖成 fail-closed。
         if (systemEnabled) problems.AddRange(agents.Problems);
 
-        var payloadText = ReadPolicyText(options.PayloadPath, "payload", required: !options.SkipContextPayload);
-        var payload = OpencodePayload.Plan(loc.ConfigHome, payloadText, options.SkipContextPayload);
+        var payloadEmptySlot = !options.SkipContextPayload && Ctx.IsEmptySlot("payload", scheme);
+        var payloadText = options.SkipContextPayload
+            ? ""
+            : ReadPolicyText(options.PayloadPath, "payload", required: !payloadEmptySlot, scheme);
+        var payload = OpencodePayload.Plan(loc.ConfigHome, payloadText, options.SkipContextPayload || payloadEmptySlot);
+        SlotRemovalPlan? payloadRemoval = null;
+        if (payloadEmptySlot)
+            payloadRemoval = SchemeSlotFile.Plan(payload.Path,
+                SchemeMarkers.Union(OpencodeMarkers.PayloadMarkers),
+                "protocol 方案的 payload 是空槽（目标位置不应有本工具的文件）");
 
         var idInput = (origin ?? "") + "\n" + instrPath + "\n" + instrText + "\n" + systemText + "\n" +
-                      agents.Next + "\n" + payloadText + "\n" + loc.ConfigHome;
+                      agents.Next + "\n" + payloadText + "\n" + loc.ConfigHome + "\n" + scheme;
         return new Plan
         {
             Loc = loc,
@@ -692,15 +828,80 @@ public sealed class OpencodeTarget : ITargetAdapter
             Agents = agents,
             SystemText = systemText,
             Payload = payload,
+            PayloadRemoval = payloadRemoval,
+            InstrEmptySlot = instrEmptySlot,
             Problems = problems,
             SystemLayer = !options.SkipSystemPrompt,
             AgentLayer = systemEnabled,
-            PayloadLayer = !options.SkipContextPayload,
+            PayloadLayer = !options.SkipContextPayload && !payloadEmptySlot,
             PreviewId = FileText.Sha256Text(idInput)[..16],
         };
     }
 
-    private string ReadPolicyText(string? overridePath, string defName, bool required)
+    /// <summary>
+    /// protocol 方案下 instructions 是空槽：不建指令文件，只把 opencode.json 里本工具此前写入的路径摘掉。
+    /// 解析不了 / instructions 类型既不是数组也不是字符串 → fail-closed（与 own 方案同口径，不做破坏性改写）。
+    /// </summary>
+    private static InstructionsEdit PlanEmptyInstructions(string configFile, string? origin, bool fileExists, string instrPath)
+    {
+        var originText = origin ?? "";
+        var zero = Array.Empty<string>();
+        var problems = new List<string>();
+
+        if (fileExists && !OpencodeConfig.TryParseObject(originText))
+            problems.Add("opencode.json 不是合法 JSON 对象：拒绝改写（protocol 方案下也需要能安全摘除 instructions 路径）。");
+
+        var entries = fileExists && problems.Count == 0 ? OpencodeConfig.EntriesOf(originText) : zero;
+        var removed = fileExists && problems.Count == 0 ? RemoveOurEntry(originText, instrPath, out _) : null;
+
+        if (removed is not null)
+            return new InstructionsEdit
+            {
+                FileExists = fileExists,
+                ParseOk = problems.Count == 0,
+                TopLevelObject = problems.Count == 0,
+                InstructionsKeyPresent = true,
+                InstructionsIsArray = true,
+                PathPresent = true,
+                WillWrite = true,
+                Origin = originText,
+                Next = removed,
+                OriginKeys = KeysOf(originText),
+                Entries = entries,
+                NextEntries = OpencodeConfig.EntriesOf(removed),
+                Problems = problems,
+                Detail = "protocol 方案的配置指令槽为空：不注入；从 instructions 里摘除本工具此前写入的路径（其余条目与键原样保留）。",
+            };
+
+        return new InstructionsEdit
+        {
+            FileExists = fileExists,
+            ParseOk = problems.Count == 0,
+            TopLevelObject = problems.Count == 0,
+            WillWrite = false,
+            Origin = originText,
+            Next = originText,
+            OriginKeys = KeysOf(originText),
+            Entries = entries,
+            NextEntries = entries,
+            Problems = problems,
+            Detail = "protocol 方案的配置指令槽为空：不注入；instructions 里没有本工具的路径（无需改动）。",
+        };
+    }
+
+    /// <summary>顶层键集合（protocol 空槽的写入后校验用；不做破坏性改写）。</summary>
+    private static IReadOnlyList<string> KeysOf(string? text)
+    {
+        try
+        {
+            return JsonNode.Parse(text ?? "") is JsonObject obj
+                ? obj.Select(p => p.Key).ToArray()
+                : Array.Empty<string>();
+        }
+        catch { return Array.Empty<string>(); }
+    }
+
+    private string ReadPolicyText(string? overridePath, string defName, bool required, InjectionScheme scheme)
     {
         if (!string.IsNullOrWhiteSpace(overridePath))
         {
@@ -710,7 +911,7 @@ public sealed class OpencodeTarget : ITargetAdapter
             return "";
         }
 
-        var def = Ctx.Def(defName)
+        var def = Ctx.DefFor(defName, scheme)
                   ?? throw new AgentEngineException(EngineErrorCode.Unsupported, $"没有名为「{defName}」的注入文本。");
         var text = Ctx.Policy.Read(def);
         if (text is null)
@@ -816,7 +1017,9 @@ public sealed class OpencodeTarget : ITargetAdapter
                 progress?.Report(new EngineProgress { Stage = "write", Message = "写入 instructions", Fraction = 0.5 });
                 FileText.Write(plan.ConfigFile, plan.Edit.Next);
 
-                var problems = OpencodeConfig.ValidateWritten(plan.ConfigFile, plan.Edit.OriginKeys, plan.InstructionsPath);
+                var problems = plan.InstrEmptySlot
+                    ? ValidateInstrRemoval(plan.ConfigFile, plan.Edit.OriginKeys, plan.InstructionsPath)
+                    : OpencodeConfig.ValidateWritten(plan.ConfigFile, plan.Edit.OriginKeys, plan.InstructionsPath);
                 if (problems.Count > 0)
                 {
                     Rollback(plan.ConfigFile, plan.Edit.Origin, plan.Edit.FileExists);
@@ -825,9 +1028,12 @@ public sealed class OpencodeTarget : ITargetAdapter
                 }
 
                 wrote = true;
-                notes.Add(Notes.Info("已写入", $"{plan.ConfigFile}：instructions 加入 {plan.InstructionsPath}", plan.ConfigFile));
-                notes.Add(Notes.Info("写入后校验",
-                    "重新解析通过：顶层是对象、instructions 是数组且含本工具路径、原有键一个不少。", plan.ConfigFile));
+                notes.Add(Notes.Info("已写入", plan.InstrEmptySlot
+                    ? $"{plan.ConfigFile}：instructions 里本工具的路径已摘除（空槽方案不注入指令文件）"
+                    : $"{plan.ConfigFile}：instructions 加入 {plan.InstructionsPath}", plan.ConfigFile));
+                notes.Add(Notes.Info("写入后校验", plan.InstrEmptySlot
+                    ? "重新解析通过：顶层是对象、instructions 里已无本工具路径、原有键一个不少。"
+                    : "重新解析通过：顶层是对象、instructions 是数组且含本工具路径、原有键一个不少。", plan.ConfigFile));
             }
             else
             {
@@ -907,6 +1113,21 @@ public sealed class OpencodeTarget : ITargetAdapter
             }
         }
 
+        // ---- 空槽清理（protocol 方案：payload 不注入，A 套遗留的 AGENTS.md 要移除） ----
+        if (plan.PayloadRemoval is { WillWrite: true } leftover)
+        {
+            progress?.Report(new EngineProgress { Stage = "cleanup", Message = "移除另一套方案遗留的 AGENTS.md", Fraction = 0.9 });
+            var deleted = SchemeSlotFile.Execute(leftover);
+            wrote |= deleted;
+            notes.Add(deleted
+                ? Notes.Info("已移除遗留文件", leftover.Note, leftover.Path)
+                : Notes.Warn("移除遗留文件失败", leftover.Note + "（删除失败，请手工核对）", leftover.Path));
+        }
+        else if (plan.PayloadRemoval is { } planned)
+        {
+            notes.Add(Notes.Info("空槽", planned.Note, planned.Path));
+        }
+
         progress?.Report(new EngineProgress { Stage = "完成", Message = wrote ? "已写入" : "无改动", Fraction = 1.0 });
         return new ApplyResult
         {
@@ -923,6 +1144,16 @@ public sealed class OpencodeTarget : ITargetAdapter
     /// <summary>载荷层备份：用户原文件逐字节存一份；污染 / 不可读的旧备份另存证据后重建。</summary>
     private static void BackupPayload(Plan plan, List<Note> notes)
     {
+        // 自家内容不备份（切换方案时另一套方案写的 AGENTS.md 也是自家的）。
+        if (OpencodePayload.IsOurs(plan.Payload.Existing) ||
+            (plan.Payload.Existing is not null &&
+             SchemeMarkers.Protocol.Any(m => plan.Payload.Existing.Contains(m, StringComparison.Ordinal))))
+        {
+            notes.Add(Notes.Info("不备份自家内容",
+                "现有 AGENTS.md 是本工具写的（含注入标记，可能来自另一套方案）：不为它建备份。", plan.Payload.Path));
+            return;
+        }
+
         var bm = new BackupManager(plan.Payload.Path);
         var ab = bm.Assess(OpencodeMarkers.PayloadMarkers);
 
@@ -952,6 +1183,15 @@ public sealed class OpencodeTarget : ITargetAdapter
     /// <summary>先备份、无备份不写；污染另存证据后重建；内容已不含注入痕迹则说明备份是升级前的旧物，另存 .superseded。</summary>
     private static void BackupFile(string path, string originalText, IReadOnlyList<string> markers, List<Note> notes, string what)
     {
+        // 自家内容不备份：本工具写的 opencode.json（含 agent prompt 里的注入文本）不该被当成"用户原文件"。
+        if (markers.Any(m => !string.IsNullOrEmpty(m) && originalText.Contains(m, StringComparison.Ordinal)) ||
+            SchemeMarkers.Protocol.Any(m => originalText.Contains(m, StringComparison.Ordinal)))
+        {
+            notes.Add(Notes.Info("不备份自家内容",
+                $"{what} 的现有内容是本工具写的（含注入标记，可能来自另一套方案）：不为它建备份。", path));
+            return;
+        }
+
         var bm = new BackupManager(path);
         var ab = bm.Assess(markers);
 
@@ -986,6 +1226,26 @@ public sealed class OpencodeTarget : ITargetAdapter
         catch { /* 回滚尽力而为；失败也照常抛出上层异常 */ }
     }
 
+    /// <summary>
+    /// protocol 空槽的写入后校验：路径必须已摘除、能解析、原有键一个不少。
+    /// （不能复用 ValidateWritten——它的判据是"路径在位"，与空槽相反。）
+    /// </summary>
+    private static IReadOnlyList<string> ValidateInstrRemoval(string path, IReadOnlyList<string> originKeys, string instrPath)
+    {
+        var text = FileText.ReadOrNull(path);
+        if (text is null) return new[] { "写入后文件读不回来（或被删除）。" };
+
+        var problems = new List<string>();
+        if (!OpencodeConfig.TryParseObject(text)) problems.Add("写入后无法解析为 JSON 对象。");
+        if (OpencodeConfig.ContainsPath(text, instrPath)) problems.Add("instructions 里仍含本工具的路径（空槽方案不该有它）。");
+
+        var keys = KeysOf(text);
+        foreach (var key in originKeys)
+            if (!keys.Contains(key, StringComparer.Ordinal)) problems.Add($"原有键丢失：{key}");
+
+        return problems;
+    }
+
     // ================================================================ 还原
 
     public RevertResult Revert(RevertOptions options, IProgress<EngineProgress>? progress, CancellationToken ct)
@@ -1014,7 +1274,7 @@ public sealed class OpencodeTarget : ITargetAdapter
         //   · 系统提示词层的开关是它自己那份注入文本；盘上确实有本层痕迹时，撤销不看开关（不搞"开关关了就留着注入"）。
         var (systemEnabled, systemText) = SystemLayerText();
         var probe = OpencodeConfig.PlanAgentPrompts(FileText.ReadOrNull(configFile), File.Exists(configFile), systemText);
-        var agentPresent = probe.AppliedAgents.Count > 0;
+        var agentPresent = probe.Agents.Any(s => s.PromptIsOurs);
         var doInstr = !options.SkipSystemPrompt;
         var doAgents = systemEnabled || agentPresent;
         var configLayers = doInstr || doAgents;
@@ -1175,7 +1435,7 @@ public sealed class OpencodeTarget : ITargetAdapter
                     var backText = FileText.ReadOrNull(configFile);
                     var leftover = backText is not null &&
                                    ((doInstr && OpencodeConfig.ContainsPath(backText, instrPath)) ||
-                                    (doAgents && OpencodeConfig.PlanAgentPrompts(backText, true, systemText).AppliedAgents.Count > 0));
+                                    (doAgents && OpencodeConfig.OurPromptCount(backText, systemText) > 0));
                     if (leftover)
                     {
                         readBackClean = false;
@@ -1360,14 +1620,15 @@ public sealed class OpencodeTarget : ITargetAdapter
                 $"instruction_blob 读出来是空的，拒绝用它做标记判定：{loc.DbPath}（{blobs} 条）。" +
                 "空文本会被判成「两层都没进模型上下文」，那是错误的排查方向——会话存在却没有常驻指令载荷，说明是读不到，不是没生效。");
 
-        var report = MarkerScanner.Scan(id, blobText, OpencodeMarkers.MarkerSpecs);
+        var specs = OpencodeMarkers.SpecsForScheme(Ctx.ActiveScheme());
+        var report = MarkerScanner.Scan(id, blobText, specs);
         var total = report.Hits.Sum(h => h.Count);
 
         var reference = "";
         try
         {
             var msgText = OpencodeDb.SessionMessageText(loc.DbPath, id, ct);
-            var refHits = OpencodeMarkers.MarkerSpecs
+            var refHits = specs
                 .Select(s => new MarkerHit { Marker = s.Marker, Layer = s.Layer, Count = FileText.Count(msgText, s.Marker) })
                 .Where(h => h.Count > 0)
                 .ToArray();
@@ -1398,10 +1659,10 @@ public sealed class OpencodeTarget : ITargetAdapter
     private MarkerReport UndecidableReport(OpencodeLocation loc, CancellationToken ct)
     {
         var rows = OpencodeDb.InstructionBlobRows(loc.DbPath, ct);
-        var ours = OpencodeMarkers.InstructionsMarkers
+        var ours = SchemeMarkers.Union(OpencodeMarkers.InstructionsMarkers
             .Concat(OpencodeMarkers.SystemLayerMarkers)
             .Concat(OpencodeMarkers.PayloadMarkers)
-            .ToArray();
+            .ToArray());
         var withMarkers = rows.Count(r => ours.Any(m => r.Contains(m, StringComparison.Ordinal)));
 
         return new MarkerReport
@@ -1487,7 +1748,7 @@ public sealed class OpencodeTarget : ITargetAdapter
             Lines = lines,
             AddedLines = added,
             RemovedLines = removed,
-            MarkerDelta = OpencodeMarkers.MarkerSpecs
+            MarkerDelta = OpencodeMarkers.SpecsForScheme(Ctx.ActiveScheme())
                 .Select(s => new MarkerHit
                 {
                     Marker = s.Marker,

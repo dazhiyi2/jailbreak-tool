@@ -22,6 +22,42 @@
 | **opencode** 2.0.x | 打包 Electron + Bun 单文件 CLI | **客户端里没有可删的安全条款**（同 DSH 型）→ 走官方配置通道：系统层 `agent.<名字>.prompt`（**关键层**）+ 配置指令层 `opencode.json` 的 `instructions` | `~/.config/opencode/AGENTS.md`（全局，**会被降级成"本机偏好"**） | `~/.local/share/opencode/opencode.db`（SQLite；推理在 `session_message.data.content[].text`，生效证据在 `instruction_blob`） |
 | **Google Antigravity**（Gemini）2.24.x | VS Code 分支 + 原生语言服务器（163.5 MB Go 二进制） | **本地评审员提示词明文在二进制里**，走等长字节补丁（工具在 `tools\patch-antigravity.ps1`，不在引擎里） | `~/.gemini/config/rules/AGENTS.md`（单文件上限 24 KB） | `~/.gemini/antigravity/conversations/*.db`（SQLite；推理在 `steps.step_payload` 的 protobuf，`step_type=15` 的 `.20.3`） |
 | **Cursor** 3.25.x | VS Code 分支 + Electron（**无 asar，`out\` 是目录**） | `system_prompt` 服务端下发（本地无明文）→ 打的是**规则框架句**：4 个 JS 文件里 `user_rules` 的定性句 `…follow if appropriate`（**"如果合适的话"= 给了裁量权**），等长替换 | 个人规则 `state.vscdb` → `ItemTable` 键 `aicontext.personalContext`；项目规则 `<workspace>\.cursor\rules\*.mdc`（`alwaysApply: true` 才进正文） | `%APPDATA%\Cursor\User\globalStorage\state.vscdb`（SQLite；`cursorDiskKV` 的 `composerData:<id>` / `bubbleId:*`；**生效证据是 `promptTokenBreakdown` 里 `rules` 档的 `characterCount`**） |
+| **Codex**（ChatGPT 桌面应用）26.1013.x | MSIX 打包 + 独立 CLI（进程名 `ChatGPT`） | **官方配置键 `model_instructions_file`**（顶层，`CODEX_HOME\config.toml`）+ 提示词文件挂进 `CODEX_HOME`。不打二进制、不劫持网络、不篡改进程 | 同上（本目标只用一套方案，见下） | `CODEX_HOME\thread_history_1.sqlite`（`thread_items`：`agentMessage.text` / `userMessage.content[].text` / `reasoning`）+ `state_5.sqlite.threads`；**读库必须连 `-wal`/`-shm` 一起拷出来** |
+
+> **Codex 只用一套方案**（gpt-instruct 原文，逐字节不动，sha256 `37382fb7…b031acac`），不做双方案切换。
+> 它的**生效判据不能用"日志里有没有指令"**——实测本地 `logs.feedback_log_body` 里 `You are` / `system prompt` / `base_instructions` / `model_instructions` **全部 0 命中**（本地没有系统提示词的记录）。所以判据是两级：**配置级**（`config.toml` 有那个键 + 文件 sha256 匹配，硬证据）+ **行为级**（新线程的 `agentMessage.text` 里有没有该提示词规定的协议特征，如 `当前：`/`Current:` 开头、`OUTPUT_CONTRACT` 这类绑定名）。详见 [docs/codex.md](docs/codex.md)。
+
+## 两套注入方案（可切换）
+
+五个目标（DSH / ZCode / opencode / Antigravity / Cursor）各有**两套注入文本**，界面里切换，切换后注入/预览/还原/状态全部作用于当前方案：
+
+| 方案 | 内容 | 性质 |
+|---|---|---|
+| **A `own`** | 本工具自己的文本（环境事实 + 交付偏好） | **陈述型**：模型可以把它归类成"某人的偏好"→ 可评价 → 可驳回 |
+| **B `protocol`** | [`gpt-instruct`](https://github.com/MDX-Tom/gpt-instruct) 的提示词原文 | **协议型**：规定"本轮请求如何被处理"（状态绑定 + 输出契约前置 + 禁止替代品 + 完成度约束）→ **没有可驳回的对象** |
+
+**为什么要两套**：opencode 那轮实测过——"本机偏好"这种陈述会被模型点名驳回。而 B 套的原文**通篇不提允许/安全/破例**，一次都不要求模型破例，所以没有东西可以拒。它靠的是控制**响应的形状与动作顺序**，不是争论"可不可以"。
+
+**实现**（**冻结契约零改动**）：契约里 `SavePolicyFileAsync(name, text)` 的名字是自由字符串 → 用**保留名 `scheme`** 当选择器（`own` / `protocol`），落盘 `<dataDir>\policy\scheme.txt`；`GetPolicyFilesAsync()` 把 `scheme` 作为只读条目返回，界面与 CLI 都能切换。文件不存在 = `own`（现有安装行为完全不变）。
+
+**B 套的载体槽**（他的原文放哪一层）：
+
+| 目标 | 载体槽 |
+|---|---|
+| DSH | `prefix`（系统提示词前缀 order 0） |
+| ZCode | `payload`（AGENTS.md） |
+| opencode | `system`（`agent.<名字>.prompt`） |
+| Antigravity | `rules`（`rules\AGENTS.md`） |
+| Cursor | `personal`（`state.vscdb` 个人规则层） |
+
+B 套里该目标的**其余槽位为空**（不注入）——切方案时另一套留下的文件会被移除，且移除前按标记确认真是本工具的文件。
+
+> B 套原文的 sha256 是 **`37382fb7082652e5b18c99fa5086fbc6d414993eaeae2ec7852ba372b031acac`（7,575 字节）**，自检里断言这一条 —— 它是"原文没被动过"的证明。
+
+> 上游那套方法最值钱的部分是**把验收条件写进提示词本体**（`INJECTED REVISION ACTION` 段要求模型从注入的父稿里**推导**出精确下一版本号，不是复制）。本工具现有的判据（`instruction_blob` 命中数 / `promptTokenBreakdown` 字符数）只能证明**送到了**；要做到**照做了**，就得用这种"要求模型推导出一个具体值"的探针。
+
+
+### opencode 的通道权力（实测记录）
 
 > opencode 的阶段 0 侦察与适配器均已完成（见 [docs/opencode.md](docs/opencode.md)）：提示词在 203.8 MB 的 Bun 单文件里但**没有安全条款**，所以不做补丁层；注入走官方配置通道。**三个通道的权力排序是实测出来的**：系统层 `agent.<名字>.prompt` 被当硬性规定执行；`instructions` 与 `AGENTS.md` 会被归类成"文件"，后者甚至被模型点名驳回为"本机偏好"。而且**系统层里也不能自我声明权威**——"与系统提示词同级"这类自证加上强制校验标记，会被直接指认成注入。
 > 它在三个目标里验证条件最好：`instruction_blob` 记录的是**真正进了模型上下文的常驻指令载荷**，所以"命中数自检"直接查"模型被告知了什么"，而不是靠聊天记录里数标记。**真实端到端已跑通**（apply → 开新会话 → blob 从 4 条涨到 6 条、命中 7 次 → revert 逐字节回厂）。
@@ -34,15 +70,15 @@
 toolkit/
 ├── AgentToolkit.slnx
 ├── backend/
-│   ├── AgentToolkit.Core/          核心库：支持层 + 五个目标适配器 + MultiTargetEngine
+│   ├── AgentToolkit.Core/          核心库：支持层 + 六个目标适配器 + MultiTargetEngine
 │   │   ├── Support/                Text 文件与备份 / Probe 多级定位 / Store 注入文本与台账 /
 │   │   │                           Logs 多帧 zstd 与 jsonl / Status 层状态装配
-│   │   └── Targets/                ITargetAdapter.cs · Dsh/ · Zcode/ · Opencode/ · Antigravity/ · Cursor/
+│   │   └── Targets/                ITargetAdapter.cs · Dsh/ · Zcode/ · Opencode/ · Antigravity/ · Cursor/ · Codex/
 │   ├── AgentToolkit.Engine.Cli/    命令行入口 → 单文件 engine.exe（自包含，无需 Node/PowerShell/.NET 运行时）
 │   ├── AgentToolkit.SelfTest/      回归自检：全部用例在沙箱副本上跑，不碰真实客户端
 │   └── dist/engine.exe
 ├── ui/                             WinUI 3 界面（未打包自包含）
-└── docs/                           五个目标的档案：资产地图、锚点、实测证据
+└── docs/                           六个目标的档案：资产地图、锚点、实测证据
 ```
 
 界面与引擎之间只有一个接缝：`ui\Services\ServiceLocator.cs` 里的一行，它返回 `MultiTargetEngine`。
@@ -65,6 +101,7 @@ $dn = 'C:\Program Files\dotnet\dotnet.exe'
 & $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target opencode
 & $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target antigravity
 & $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target cursor
+& $dn run --project toolkit\backend\AgentToolkit.SelfTest\AgentToolkit.SelfTest.csproj -- --target codex
 ```
 
 ## 命令行用法

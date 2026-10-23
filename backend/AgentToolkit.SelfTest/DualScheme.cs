@@ -157,7 +157,6 @@ public static class DualScheme
     // ---------------------------------------------------------------- 真实客户端只读
 
     private static string Home => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-    private static string AppData => Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
 
     /// <summary>该目标涉及的真实客户端路径（只读；自检期间一个字节都不许动）。</summary>
     public static IReadOnlyList<string> RealRootsFor(string targetId) => targetId switch
@@ -169,8 +168,6 @@ public static class DualScheme
             Path.Combine(Home, ".config", "opencode"),
             Path.Combine(Home, ".local", "share", "opencode"),
         },
-        "antigravity" => new[] { Path.Combine(Home, ".gemini") },
-        "cursor" => new[] { Path.Combine(AppData, "Cursor") },
         _ => AllRealRoots(),
     };
 
@@ -181,8 +178,6 @@ public static class DualScheme
         Path.Combine(Home, ".zcode"),
         Path.Combine(Home, ".config", "opencode"),
         Path.Combine(Home, ".local", "share", "opencode"),
-        Path.Combine(Home, ".gemini"),
-        Path.Combine(AppData, "Cursor"),
     };
 
     public static IReadOnlyList<SnapshotEntry> CaptureRealEntries(string targetId) =>
@@ -205,7 +200,7 @@ public static class DualScheme
         new(CaptureRealEntries(targetId), IdleChurn(targetId, idleMs));
 
     /// <summary>
-    /// 自检结束时对比快照。判据与 Codex 那一套一致：
+    /// 自检结束时对比快照。判据与各目标适配器那一套一致：
     ///   1) 注入落点这类"内容口径"的关键文件必须逐字节不变；
     ///   2) 运行窗口里变化的文件键，必须全部落在**空闲窗口里自己在变**的集合里（客户端自己在写）；
     ///   3) 剩下的（解释不了的）变化项必须为 0。

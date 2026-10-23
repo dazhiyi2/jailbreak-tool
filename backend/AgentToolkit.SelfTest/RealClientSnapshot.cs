@@ -39,7 +39,7 @@ public static class RealClientSnapshot
         @"\gpucache\", @"\tmp\", @"\temp\", @"\history\", @"\state\", @"\workspacestorage\",
         @"\blob_storage\", @"\service worker\", @"\crashpad\", @"\dawncache\", @"\dawn_graphitecache\",
         @"\dawnwebgpucache\", @"\lockfile", @"\.log", @"\.jsonl", @"\.ndjson", @"\.db-wal", @"\.db-shm",
-        @"\.breach-cursor-path.json", @"\.breach-opencode-path.json",
+        @"\.breach-opencode-path.json",
     };
 
     public static bool IsLiveState(string relativeOrFullPath)

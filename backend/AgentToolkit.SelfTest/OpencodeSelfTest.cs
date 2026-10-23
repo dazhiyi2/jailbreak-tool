@@ -805,6 +805,58 @@ public sealed class OpencodeSelfTest : ITargetSelfTest
         r.Check(cands[0].Exe == Path.Combine(newVer, "opencode-cli.exe"), "候选带出 exe 路径");
         r.Check(cands.Any(c => c.Version == "2.0.31-x64"), "旧版本候选也在列表里（诊断用，不丢）");
 
+        // ---- npm 全局布局（issue #1）：<prefix>\node_modules\@opencode\cli\bin\opencode.exe + package.json ----
+        r.Step("    · npm 全局布局（issue #1）");
+        var fakePrefix = Path.Combine(e.Sandbox, "fake-npm", "nodejs");
+        var fakePkg = Path.Combine(fakePrefix, "node_modules", "@opencode", "cli");
+        var fakeBin = Path.Combine(fakePkg, "bin");
+        Directory.CreateDirectory(fakeBin);
+        FileText.Write(Path.Combine(fakeBin, "opencode.exe"), "MZ-npm");
+        FileText.Write(Path.Combine(fakePkg, "package.json"), "{\"name\":\"@opencode/cli\",\"version\":\"2.1.2\"}");
+
+        var npmCands = OpencodeLocator.CliCandidates(fakePrefix);
+        r.Check(npmCands.Count == 1, $"npm prefix 下只认一个 CLI 候选（实际 {npmCands.Count} 个）");
+        r.Check(npmCands[0].Exe == Path.Combine(fakeBin, "opencode.exe"),
+            "npm 布局认 bin\\opencode.exe（不再只认 opencode-cli.exe）");
+        r.Check(npmCands[0].Version == "2.1.2", $"npm 布局的版本读自包内 package.json（{npmCands[0].Version}）");
+
+        var pkgCands = OpencodeLocator.CliCandidates(fakePkg);
+        r.Check(pkgCands.Count == 1 && pkgCands[0].Version == "2.1.2",
+            $"直接把 npm 包目录当根，版本仍是 package.json 的（{pkgCands.FirstOrDefault()?.Version}）");
+
+        // BOM 容错：Windows 上手工编辑过的 package.json 常带 UTF-8 BOM，JsonDocument 会直接抛
+        FileText.Write(Path.Combine(fakePkg, "package.json"), "\uFEFF{\"version\":\"3.3.3\"}");
+        r.Check(OpencodeLocator.VersionFromPackageJson(fakePkg) == "3.3.3",
+            "package.json 带 UTF-8 BOM 也能读出 version");
+        FileText.Write(Path.Combine(fakePkg, "package.json"), "{\"name\":\"@opencode/cli\",\"version\":\"2.1.2\"}");
+
+        // 只认 package.json 作为 npm 包的正面信号：光有 bin\*.exe 不算（防 Electron 目录里的 bin 误判）
+        var bareRoot = Path.Combine(e.Sandbox, "fake-npm", "bare");
+        var bareBin = Path.Combine(bareRoot, "bin");
+        Directory.CreateDirectory(bareBin);
+        FileText.Write(Path.Combine(bareBin, "opencode.exe"), "MZ-bare");
+        r.Check(OpencodeLocator.CliCandidates(bareRoot).Count == 0,
+            "没有 package.json 的 bin\\*.exe 不当作 npm 包（防 Electron 目录里的 bin 误判）");
+
+        // ExeIn 同时认两种文件名
+        r.Check(OpencodeLocator.ExeIn(fakeBin) is not null, "ExeIn 认 opencode.exe");
+        r.Check(OpencodeLocator.ExeIn(newVer) is not null, "ExeIn 认 opencode-cli.exe");
+
+        // OPENCODE_NPM_PREFIX 显式指定时压过自动发现（本机同时有 %APPDATA%\ai.opencode.desktop，正好验证优先级）
+        setEnv("OPENCODE_ROOT", null);
+        setEnv("OPENCODE_NPM_PREFIX", fakePrefix);
+        var npmLoc = OpencodeLocator.Resolve(new LocateOptions { IgnoreMemory = true }, false, default);
+        r.Check(npmLoc.Version == "2.1.2", $"OPENCODE_NPM_PREFIX 生效：版本 {npmLoc.Version}");
+        r.Check(npmLoc.LocatedBy is not null && npmLoc.LocatedBy.Contains("OPENCODE_NPM_PREFIX", StringComparison.Ordinal),
+            $"来源标注为显式 npm 变量（{npmLoc.LocatedBy}）");
+        r.Check(npmLoc.Exe == Path.Combine(fakeBin, "opencode.exe"), $"显式 npm prefix 下 Exe 指向 bin\\opencode.exe（{npmLoc.Exe}）");
+        setEnv("OPENCODE_NPM_PREFIX", null);
+
+        // --root 指到 npm 包目录也要能解释出来（issue #1 的 fail-closed 场景）
+        var byRootNpm = OpencodeLocator.Resolve(new LocateOptions { ExplicitRoot = fakePkg }, false, default);
+        r.Check(byRootNpm.Found, "--root 指到 npm 包目录不再 fail-closed");
+        r.Check(byRootNpm.Version == "2.1.2", $"--root npm 包目录时版本为 2.1.2（实际 {byRootNpm.Version}）");
+
         setEnv("OPENCODE_CONFIG", e.ConfigHome);
         setEnv("OPENCODE_ROOT", e.InstallRoot);
         ctx.Log($"locate ok: {e.CliExe}");

@@ -36,27 +36,58 @@ public sealed class OpencodeLocation
 }
 
 /// <summary>
-/// opencode 定位器。目标布局（本机实测 2.0.32-x64）：
+/// opencode 定位器。**两种安装布局都认**（issue #1）：
+///
+/// 桌面版（本机实测 2.0.32-x64）：
 /// <code>
 /// %APPDATA%\ai.opencode.desktop\cli\&lt;版本&gt;\opencode-cli.exe   Bun 编译的单文件 CLI（203.8 MB，不是注入点）
+/// </code>
+///
+/// npm 全局安装：
+/// <code>
+/// &lt;npm prefix&gt;\node_modules\@opencode\cli\bin\opencode.exe     版本在包内 package.json 的 version
+/// &lt;npm prefix&gt;\opencode.ps1 / opencode.cmd                   shim（prefix 通常在 PATH 上）
+/// </code>
+///
+/// 注入点（两种布局相同）：
+/// <code>
 /// ~/.config/opencode/opencode.json                            官方配置通道（instructions 键 → 配置指令层）
 /// ~/.config/opencode/AGENTS.md                                全局指令文件（上下文载荷层）
 /// ~/.local/share/opencode/opencode.db                         SQLite + WAL 会话库（推理原文落点）
 /// </code>
 ///
-/// 解析顺序：CLI --root（允许传安装根 / exe / 配置根）→ 环境变量 OPENCODE_ROOT / OPENCODE_CONFIG
+/// 解析顺序：CLI --root（允许传安装根 / exe / npm 包目录 / 配置根）→ 环境变量 OPENCODE_ROOT / OPENCODE_CONFIG
 ///          → 记忆文件 ~/.breach-opencode-path.json → 运行中进程 opencode-cli
-///          → 安装目录 %APPDATA%\ai.opencode.desktop（cli 下有多个版本目录时取 mtime 最新的那个）
+///          → 桌面版安装目录 %APPDATA%\ai.opencode.desktop
+///          → **npm 全局**（OPENCODE_NPM_PREFIX → %APPDATA%\npm → PATH 反查 node_modules\@opencode\cli）
 ///          → XDG_CONFIG_HOME / XDG_DATA_HOME → ~/.config/opencode、~/.local/share/opencode
 ///          → 浅嗅探（附加，最低优先）。
 ///
+/// 版本来源优先级：**包内 package.json 的 version** → 目录名（桌面版 cli\&lt;版本&gt; 才有效）。
 /// 显式指定的路径无效时 **fail-closed**：不回退、不猜，返回 NotFound 并把「试过哪些路径」填进 Attempts。
-/// 注意：OPENCODE_ROOT / OPENCODE_CONFIG 是本工具的约定变量，**不是** opencode 官方变量（见 Notes）。
+/// 注意：OPENCODE_ROOT / OPENCODE_CONFIG / OPENCODE_NPM_PREFIX 是本工具的约定变量，
+///       **不是** opencode / npm 官方变量（见 Notes）。
 /// </summary>
 public static class OpencodeLocator
 {
     public const string ProcessName = "opencode-cli";
+    /// <summary>桌面版的 CLI 文件名（%APPDATA%\ai.opencode.desktop\cli\&lt;版本&gt;\opencode-cli.exe）。</summary>
     public const string CliExeName = "opencode-cli.exe";
+
+    /// <summary>
+    /// CLI 可执行文件名候选。桌面版是 opencode-cli.exe；**npm 全局安装**是
+    /// &lt;npm prefix&gt;\node_modules\@opencode\cli\bin\opencode.exe。两套布局必须都认，
+    /// 否则 npm 全局安装的用户会看到「版本 ?」+「找不到 opencode-cli.exe」（issue #1）。
+    /// 无扩展名的两项是给非 Windows / 无 .exe 后缀的安装形态留的。
+    /// </summary>
+    public static readonly string[] CliExeNames = { "opencode-cli.exe", "opencode.exe", "opencode-cli", "opencode" };
+
+    /// <summary>npm 全局安装的包相对路径（相对 npm prefix）。</summary>
+    public const string NpmPackageRelPath = @"node_modules\@opencode\cli";
+
+    /// <summary>npm prefix 重定向（本工具约定变量，npm 官方没有这个变量）。</summary>
+    public const string NpmPrefixEnv = "OPENCODE_NPM_PREFIX";
+
     public const string AppDirName = "ai.opencode.desktop";
     public const string CliDirName = "cli";
 
@@ -126,48 +157,150 @@ public static class OpencodeLocator
         }
     }
 
-    /// <summary>cli 目录下的一个版本候选。</summary>
+    /// <summary>一个 CLI 候选（桌面版版本目录 / npm 包 / 安装根直下等）。</summary>
     public sealed class CliCandidate
     {
         public required string Dir { get; init; }
         public required string Version { get; init; }
         public string? Exe { get; init; }
         public DateTimeOffset Mtime { get; init; }
+        /// <summary>命中的布局（写进诊断，便于判断是桌面版还是 npm 全局）。</summary>
+        public string Layout { get; init; } = "";
         public override string ToString() =>
-            $"{Version} ← {Dir}（{Mtime:yyyy-MM-dd HH:mm:ss}{(Exe is null ? "，缺 exe" : "")}）";
+            $"{Version} ← {Dir}（{Mtime:yyyy-MM-dd HH:mm:ss}{(Exe is null ? "，缺 exe" : "")}{(Layout.Length > 0 ? "，" + Layout : "")}）";
+    }
+
+    /// <summary>目录里任意一个 CLI 可执行文件名命中就返回它的完整路径。</summary>
+    public static string? ExeIn(string dir)
+    {
+        foreach (var n in CliExeNames)
+        {
+            try
+            {
+                var p = Path.Combine(dir, n);
+                if (File.Exists(p)) return p;
+            }
+            catch { /* 非法路径 */ }
+        }
+        return null;
+    }
+
+    /// <summary>从 &lt;dir&gt;\package.json 读 version；读不到返回 null。
+    /// 容忍 UTF-8 BOM 与前导空白（Windows 上手工编辑过的 package.json 常带 BOM，
+    /// JsonDocument 会把 BOM 当非法字符直接抛）。</summary>
+    public static string? VersionFromPackageJson(string? dir)
+    {
+        if (string.IsNullOrWhiteSpace(dir)) return null;
+        try
+        {
+            var pj = Path.Combine(dir!, "package.json");
+            if (!File.Exists(pj)) return null;
+            var raw = File.ReadAllText(pj);
+            if (raw.Length > 0 && raw[0] == '\uFEFF') raw = raw[1..];
+            raw = raw.TrimStart();
+            if (raw.Length == 0) return null;
+            using var doc = JsonDocument.Parse(raw);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object
+                && doc.RootElement.TryGetProperty("version", out var v)
+                && v.ValueKind == JsonValueKind.String)
+            {
+                var s = v.GetString();
+                return string.IsNullOrWhiteSpace(s) ? null : s!.Trim();
+            }
+        }
+        catch { /* 坏 JSON / 权限 */ }
+        return null;
     }
 
     /// <summary>
-    /// cli 目录下的全部版本候选，按修改时间（exe 与目录取较新者）倒序。
-    /// 也认「安装根直下就有 exe」与「cli 直下就有 exe」两种布局。
+    /// npm 全局安装的 prefix 候选：显式变量 → %APPDATA%\npm（Windows 默认）→ PATH 里含
+    /// node_modules\@opencode\cli 的目录。npm 把 shim 放在 prefix 上并把 prefix 加进 PATH，
+    /// 所以 PATH 反查是唯一能覆盖「自定义 prefix」的办法（issue #1 的 D:\UsrCmd\nodejs 就是这种）。
     /// </summary>
-    public static IReadOnlyList<CliCandidate> CliCandidates(string appRoot)
+    public static IReadOnlyList<string> NpmGlobalRoots()
+    {
+        var list = new List<string>();
+
+        var over = Env(NpmPrefixEnv);
+        if (over is not null) list.Add(over!);
+
+        var appData = Env("APPDATA")
+                      ?? (Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData) is { Length: > 0 } ap ? ap : null);
+        if (appData is not null) list.Add(Path.Combine(appData, "npm"));
+
+        var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
+        foreach (var raw in pathVar.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var d = raw.Trim().Trim('"');
+            if (d.Length == 0) continue;
+            try
+            {
+                if (Directory.Exists(Path.Combine(d, NpmPackageRelPath))) list.Add(d);
+            }
+            catch { /* 非法路径 */ }
+        }
+
+        return list.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    /// <summary>
+    /// 给定任意根，枚举其下全部 CLI 候选，按修改时间（exe 与目录取较新者）倒序。
+    /// **布局无关**：同时认桌面版与 npm 全局两种形态（issue #1）。
+    /// <code>
+    /// 桌面版    &lt;app&gt;\cli\&lt;版本&gt;\opencode-cli.exe      版本 = package.json（若有）→ 目录名
+    /// 桌面版    &lt;app&gt;\cli\opencode-cli.exe              版本 = package.json（若有）→ cli 直下
+    /// 桌面版    &lt;app&gt;\opencode-cli.exe                  版本 = package.json（若有）→ 安装根直下
+    /// npm 包    &lt;pkg&gt;\bin\opencode.exe                  版本 = &lt;pkg&gt;\package.json
+    /// npm prefix &lt;prefix&gt;\node_modules\@opencode\cli     走上一行，版本来自包内 package.json
+    /// </code>
+    /// </summary>
+    public static IReadOnlyList<CliCandidate> CliCandidates(string root)
     {
         var list = new List<CliCandidate>();
 
-        void Add(string dir, string version)
+        // dir = exe 所在目录；versionDir = 读 package.json 的目录（npm 布局下是包目录，不是 bin\）
+        void Add(string dir, string? versionDir, string fallbackVersion, string layout)
         {
-            var exe = Path.Combine(dir, CliExeName);
-            var hasExe = File.Exists(exe);
+            var exe = ExeIn(dir);
+            var version = VersionFromPackageJson(versionDir) ?? fallbackVersion;
             var mtime = DateTimeOffset.MinValue;
             try
             {
-                if (hasExe) mtime = File.GetLastWriteTimeUtc(exe);
+                if (exe is not null) mtime = File.GetLastWriteTimeUtc(exe);
                 var d = Directory.GetLastWriteTimeUtc(dir);
                 if (d > mtime) mtime = d;
             }
             catch { /* 读不到时间不影响候选 */ }
-            list.Add(new CliCandidate { Dir = dir, Version = version, Exe = hasExe ? exe : null, Mtime = mtime });
+            list.Add(new CliCandidate { Dir = dir, Version = version, Exe = exe, Mtime = mtime, Layout = layout });
         }
 
         try
         {
-            if (File.Exists(Path.Combine(appRoot, CliExeName))) Add(appRoot, "(安装根直下)");
-            var cli = CliRoot(appRoot);
+            // ① 自身就是 npm 包目录（…\node_modules\@opencode\cli）
+            //    判据里必须带 package.json：光有 bin\*.exe 不足以证明是 npm 包
+            //    （Electron 应用目录下也可能有 bin\，会误判）。
+            var selfBin = Path.Combine(root, "bin");
+            if (Directory.Exists(selfBin) && ExeIn(selfBin) is not null
+                && File.Exists(Path.Combine(root, "package.json")))
+                Add(selfBin, root, Path.GetFileName(root.TrimEnd('\\', '/')), "npm 包目录（bin\\ + package.json）");
+
+            // ② 自身是 npm prefix
+            var pkg = Path.Combine(root, NpmPackageRelPath);
+            if (Directory.Exists(pkg) && File.Exists(Path.Combine(pkg, "package.json")))
+            {
+                var pkgBin = Path.Combine(pkg, "bin");
+                if (ExeIn(pkgBin) is not null)
+                    Add(pkgBin, pkg, "(package.json 无 version)", "npm 全局（node_modules\\@opencode\\cli\\bin）");
+            }
+
+            // ③ 桌面版三种位置
+            if (ExeIn(root) is not null) Add(root, root, "(安装根直下)", "安装根直下");
+            var cli = CliRoot(root);
             if (Directory.Exists(cli))
             {
-                foreach (var d in Directory.EnumerateDirectories(cli)) Add(d, Path.GetFileName(d.TrimEnd('\\', '/')));
-                if (File.Exists(Path.Combine(cli, CliExeName))) Add(cli, "(cli 直下)");
+                foreach (var d in Directory.EnumerateDirectories(cli))
+                    Add(d, d, Path.GetFileName(d.TrimEnd('\\', '/')), "cli\\<版本>\\");
+                if (ExeIn(cli) is not null) Add(cli, root, "(cli 直下)", "cli 直下");
             }
         }
         catch { /* 权限 */ }
@@ -225,25 +358,58 @@ public static class OpencodeLocator
 
         if (File.Exists(p))
         {
-            if (!p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return null;
+            // 任意 CLI 名都接受：桌面版 opencode-cli.exe / npm 全局 opencode.exe / 无扩展名
+            var name = Path.GetFileName(p);
+            if (!CliExeNames.Any(n => n.Equals(name, StringComparison.OrdinalIgnoreCase))) return null;
             var dir = Path.GetDirectoryName(p);
             if (dir is null) return null;
-            var appRoot = AppRootFromCliDir(dir) ?? dir;
-            var version = AppRootFromCliDir(dir) is null ? null : Path.GetFileName(dir.TrimEnd('\\', '/'));
-            return new Interpreted { InstallRoot = appRoot, Exe = p, Version = version, How = "cli:--root(exe)" };
+
+            // 桌面版：<app>\cli\<版本>\<exe>
+            var appRoot = AppRootFromCliDir(dir);
+            if (appRoot is not null)
+                return new Interpreted
+                {
+                    InstallRoot = appRoot,
+                    Exe = p,
+                    Version = VersionFromPackageJson(dir) ?? Path.GetFileName(dir.TrimEnd('\\', '/')),
+                    How = "cli:--root(桌面版 exe)",
+                };
+
+            // npm 全局：<pkg>\bin\<exe> → 包目录就是 dir 的父目录
+            if (Path.GetFileName(dir.TrimEnd('\\', '/')).Equals("bin", StringComparison.OrdinalIgnoreCase))
+            {
+                var pkgDir = Path.GetDirectoryName(dir.TrimEnd('\\', '/'));
+                if (pkgDir is not null)
+                    return new Interpreted
+                    {
+                        InstallRoot = pkgDir,
+                        Exe = p,
+                        Version = VersionFromPackageJson(pkgDir),
+                        How = "cli:--root(npm 包 exe)",
+                    };
+            }
+
+            // 其它：exe 所在目录当安装根
+            return new Interpreted
+            {
+                InstallRoot = dir,
+                Exe = p,
+                Version = VersionFromPackageJson(dir),
+                How = "cli:--root(exe)",
+            };
         }
 
         if (!Directory.Exists(p)) return null;
 
-        // 1) 版本目录：<app>\cli\<版本>\ 里直接就有 exe
-        var directExe = Path.Combine(p, CliExeName);
-        if (File.Exists(directExe))
+        // 1) 目录里直接就有 exe（桌面版版本目录 / npm 包目录 / 安装根直下）
+        var directExe = ExeIn(p);
+        if (directExe is not null)
             return new Interpreted
             {
                 InstallRoot = AppRootFromCliDir(p) ?? p,
                 Exe = directExe,
-                Version = Path.GetFileName(p.TrimEnd('\\', '/')),
-                How = "cli:--root(版本目录)",
+                Version = VersionFromPackageJson(p) ?? Path.GetFileName(p.TrimEnd('\\', '/')),
+                How = "cli:--root(目录直下就有 exe)",
             };
 
         // 2) 安装根：<app>\cli\<版本>\
@@ -399,9 +565,13 @@ public static class OpencodeLocator
                 explicitFail = explicitRoot;
                 notes.Add(Notes.Warn("显式路径无效（fail-closed）",
                     $"显式指定的路径解释不出 opencode 的安装根 / exe / 配置根：{explicitRoot}。" +
-                    "判据：安装根要有 cli\\<版本>\\opencode-cli.exe，配置根要有 opencode.json / AGENTS.md / service.json。" +
+                    "判据：安装根要有 cli\\<版本>\\opencode-cli.exe（桌面版）或 bin\\opencode.exe（npm 全局），" +
+                    "配置根要有 opencode.json / AGENTS.md / service.json。" +
                     "按纪律不回退、不猜其它位置。", "cli"));
-                notes.Add(Notes.Info("怎么指定", "允许传：安装根（%APPDATA%\\ai.opencode.desktop）、opencode-cli.exe、或配置根（~/.config/opencode）。", "cli"));
+                notes.Add(Notes.Info("怎么指定",
+                    "允许传：桌面版安装根（%APPDATA%\\ai.opencode.desktop）、桌面版 exe（opencode-cli.exe）、" +
+                    $"npm 全局包目录（<npm prefix>\\{NpmPackageRelPath}）、npm 全局 exe（bin\\opencode.exe）、" +
+                    "或配置根（~/.config/opencode）。npm 全局安装请指到 …\\node_modules\\@opencode\\cli。", "cli"));
                 return Fail(attempts, notes, configHome, dataHome, sniffCandidates, sniffHits, versionCandidates);
             }
             installRoot = it.InstallRoot;
@@ -441,6 +611,36 @@ public static class OpencodeLocator
             else
             {
                 Add("env", $"({RootEnv} 未设置)", false, "本工具约定变量");
+            }
+        }
+
+        // ---- 2b. 显式 npm prefix（OPENCODE_NPM_PREFIX）：显式指定优先于自动发现 ----
+        if (installRoot is null && explicitRoot is null)
+        {
+            var envNpm = Clean(Env(NpmPrefixEnv));
+            if (envNpm is not null)
+            {
+                var cands = CliCandidates(envNpm!);
+                var best = cands.FirstOrDefault(c => c.Exe is not null);
+                Add("env", $"{NpmPrefixEnv}={envNpm}", best is not null,
+                    best is null ? "该 prefix 下没有 node_modules\\@opencode\\cli\\bin\\<exe>" : $"{best.Layout}，版本 {best.Version}");
+                if (best is not null)
+                {
+                    installRoot = envNpm;
+                    exe = best.Exe;
+                    version = best.Version;
+                    locatedBy = $"{NpmPrefixEnv}（本工具约定变量）";
+                    versionCandidates = cands.Select(c => c.ToString()).ToArray();
+                    notes.Add(Notes.Info("npm prefix 显式指定",
+                        $"按 {NpmPrefixEnv} 使用 npm 全局布局：{best.Dir}（{best.Layout}），版本 {best.Version}。" +
+                        "显式变量优先于自动发现，所以本机若同时装了桌面版，桌面版本次不采用。", NpmPrefixEnv));
+                }
+                else
+                {
+                    notes.Add(Notes.Warn("npm prefix 无效",
+                        $"{NpmPrefixEnv}={envNpm} 下没有 {NpmPackageRelPath}\\bin\\<exe>，已忽略（继续往下找）。" +
+                        $"注意：{NpmPrefixEnv} 是本工具的约定变量，不是 npm 官方变量。", NpmPrefixEnv));
+                }
             }
         }
 
@@ -497,7 +697,7 @@ public static class OpencodeLocator
             versionCandidates = cands.Select(c => c.ToString()).ToArray();
             if (cands.Count == 0)
             {
-                Add("install", appRoot, false, Directory.Exists(appRoot) ? "目录在，但 cli\\ 下没有 opencode-cli.exe" : "目录不存在");
+                Add("install", appRoot, false, Directory.Exists(appRoot) ? "目录在，但 cli\\ 下没有 CLI 可执行文件（opencode-cli.exe / opencode.exe）" : "目录不存在（当前是 npm 全局安装或未安装桌面版）");
             }
             else
             {
@@ -516,6 +716,33 @@ public static class OpencodeLocator
                         CliRoot(appRoot)));
                 else
                     notes.Add(Notes.Info("CLI 版本", $"{best.Version} ← {best.Dir}", CliRoot(appRoot)));
+            }
+        }
+
+        // ---- 5b. npm 全局安装（<prefix>\node_modules\@opencode\cli；issue #1） ----
+        if (installRoot is null && explicitRoot is null)
+        {
+            var npmRoots = NpmGlobalRoots();
+            Add("npm", npmRoots.Count == 0
+                    ? $"(无候选：{NpmPrefixEnv} 未设、%APPDATA%\\npm 不在、PATH 里也没有含 {NpmPackageRelPath} 的目录)"
+                    : string.Join("；", npmRoots),
+                false, "npm 全局布局：<prefix>\\node_modules\\@opencode\\cli\\bin\\opencode.exe");
+
+            foreach (var r in npmRoots)
+            {
+                var cands = CliCandidates(r);
+                var bestNpm = cands.FirstOrDefault(c => c.Exe is not null);
+                if (bestNpm is null) continue;
+                Add("npm", bestNpm.Dir, true, $"{bestNpm.Layout}，版本 {bestNpm.Version}");
+                installRoot = r;
+                exe = bestNpm.Exe;
+                version = bestNpm.Version;
+                locatedBy = $"npm（{r}）";
+                if (versionCandidates.Count == 0) versionCandidates = cands.Select(c => c.ToString()).ToArray();
+                notes.Add(Notes.Info("npm 全局安装",
+                    $"CLI 在 {bestNpm.Dir}（{bestNpm.Layout}），版本 {bestNpm.Version} 读自包内 package.json。" +
+                    "该布局下注入点仍是配置与指令文件，CLI 只用于版本显示与 Exe 探针。", r));
+                break;
             }
         }
 
@@ -554,9 +781,19 @@ public static class OpencodeLocator
             {
                 // 配置/数据根在，CLI 不在：注入点本来就不依赖 CLI，仍算定位成功。
                 Add("config", configHome, configExists, "配置根（注入点所在）");
-                notes.Add(Notes.Warn("没找到 opencode-cli.exe",
-                    "只定位到配置根 / 数据根，没有定位到 CLI 单文件（%APPDATA%\\ai.opencode.desktop\\cli\\<版本>\\opencode-cli.exe）。" +
-                    "对本目标不是阻塞：注入点是配置与指令文件，不是 bundle。Exe 留空。", "locate"));
+
+                // 按 issue #1 的反馈拆成两条，别让它们在同一句里相互放大：
+                //   ① 「本目标设计上不做二进制注入」是本目标的固有设计，跟有没有找到 CLI 无关
+                //   ② 「CLI 未定位」只影响版本显示与 Exe 探针，不影响注入
+                notes.Add(Notes.Info("本目标设计上不做二进制注入",
+                    "opencode 的注入点是配置与指令文件（opencode.json 的 instructions、AGENTS.md），" +
+                    "不碰 203.8 MB 的 Bun 单文件 CLI。所以「Exe 留空」对本目标是正常状态，不是版本不支持。", "locate"));
+                notes.Add(Notes.Info("CLI 未定位（不影响注入）",
+                    "两种布局都没命中：桌面版 %APPDATA%\\ai.opencode.desktop\\cli\\<版本>\\opencode-cli.exe，" +
+                    "npm 全局 <prefix>\\node_modules\\@opencode\\cli\\bin\\opencode.exe。" +
+                    "版本号因此显示为 “?”。要补齐版本显示：" +
+                    $"① 用 --root 指到 npm 包目录（<prefix>\\node_modules\\@opencode\\cli）；或 ② 设 {NpmPrefixEnv}=<npm prefix>；" +
+                    "③ 把 <npm prefix> 放进 PATH（本工具会按 PATH 反查）。", "locate"));
                 return Found(installRoot: null, exe: null, version: null,
                     locatedBy: configExists ? "config（配置根）" : "data（数据根）",
                     configHome, dataHome, rootIsConfigHome: true, attempts, sniffCandidates, sniffHits.ToArray(),
@@ -564,8 +801,9 @@ public static class OpencodeLocator
             }
 
             notes.Add(Notes.Error("未找到 opencode",
-                "多级探测（CLI --root → 环境变量 → 记忆文件 → 运行进程 → %APPDATA%\\ai.opencode.desktop → XDG → ~/.config/opencode）全部未命中。" +
-                $"可用 --root <DIR> 显式指定：安装根（{AppRoot()}）、opencode-cli.exe、或配置根（{defaultConfig}）。", "locate"));
+                "多级探测（CLI --root → 环境变量 → 记忆文件 → 运行进程 → %APPDATA%\\ai.opencode.desktop → npm 全局 → XDG → ~/.config/opencode）全部未命中。" +
+                $"可用 --root <DIR> 显式指定：安装根（{AppRoot()}）、桌面版 exe（{CliExeName}）、" +
+                $"npm 包目录（<npm prefix>\\{NpmPackageRelPath}）、或配置根（{defaultConfig}）。", "locate"));
             foreach (var t in attempts.Where(a => !a.Hit).Select(a => $"{a.Level}({a.Candidate})").Distinct())
                 notes.Add(Notes.Info("试过", t, "locate"));
             return Fail(attempts, notes, configHome, dataHome, sniffCandidates, sniffHits, versionCandidates);

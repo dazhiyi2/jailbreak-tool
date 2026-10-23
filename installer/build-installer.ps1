@@ -8,7 +8,7 @@
 
 [CmdletBinding()]
 param(
-  [string]$Version = '1.1.0',
+  [string]$Version = '2.0.0',
   [string]$Stage = "$env:TEMP\agent-toolkit-stage",
   [string]$OutDir = '',
   [switch]$SkipPublish,
@@ -62,9 +62,6 @@ $docMap = @{
   'docs\dsh.md'     = 'dsh.md'
   'docs\zcode.md'   = 'zcode.md'
   'docs\opencode.md'= 'opencode.md'
-  'docs\gemini.md'  = 'gemini.md'
-  'docs\cursor.md'  = 'cursor.md'
-  'docs\codex.md'   = 'codex.md'
   'docs\probes.md'  = 'probes.md'
   'docs\verification.md' = 'verification.md'
 }
@@ -72,9 +69,9 @@ foreach ($k in $docMap.Keys) {
   $src = Join-Path $Toolkit $k
   if (Test-Path $src) { Copy-Item $src (Join-Path "$Stage\docs" $docMap[$k]) -Force }
 }
-# 工具脚本：Antigravity 的等长字节补丁（引擎不做这个，单独给运维用）
+# 工具脚本：界面交互回归（UIA 驱动，只点导航，不点执行）
 New-Item -ItemType Directory -Force -Path "$Stage\docs\tools" | Out-Null
-foreach ($t in @('patch-antigravity.ps1', 'ui-regression.ps1')) {
+foreach ($t in @('ui-regression.ps1')) {
   $src = Join-Path $Toolkit "tools\$t"
   if (Test-Path $src) { Copy-Item $src (Join-Path "$Stage\docs\tools" $t) -Force }
 }

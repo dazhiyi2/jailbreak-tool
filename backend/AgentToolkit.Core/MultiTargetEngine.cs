@@ -1,9 +1,6 @@
 using AgentToolkit.Contracts;
 using AgentToolkit.Core.Support;
 using AgentToolkit.Core.Targets;
-using AgentToolkit.Core.Targets.Antigravity;
-using AgentToolkit.Core.Targets.Codex;
-using AgentToolkit.Core.Targets.Cursor;
 using AgentToolkit.Core.Targets.Dsh;
 using AgentToolkit.Core.Targets.Opencode;
 using AgentToolkit.Core.Targets.Zcode;
@@ -27,9 +24,6 @@ public sealed class MultiTargetEngine : IAgentEngine
         Register(new DshTarget(BuildContext("dsh", root)));
         Register(new ZcodeTarget(BuildContext("zcode", root)));
         Register(new OpencodeTarget(BuildContext("opencode", root)));
-        Register(new AntigravityTarget(BuildContext("antigravity", root)));
-        Register(new CursorTarget(BuildContext("cursor", root)));
-        Register(new CodexTarget(BuildContext("codex", root)));
 
         _currentId = _adapters.ContainsKey("dsh") ? "dsh" : _adapters.Keys.First();
     }
@@ -46,10 +40,8 @@ public sealed class MultiTargetEngine : IAgentEngine
             "dsh" => DshTarget.PolicyDefs,
             "zcode" => ZcodeTarget.PolicyDefs,
             "opencode" => OpencodeTarget.PolicyDefs,
-            "cursor" => CursorTarget.PolicyDefs,
-            // 必须显式列出：下面的 `_ =>` 兜底是 Antigravity，漏了 codex 会让它拿到 Antigravity 的注入文本。
-            "codex" => CodexTarget.PolicyDefs,
-            _ => AntigravityTarget.PolicyDefs,
+            // 兜底必须 fail-closed：不认识的目标 id 直接抛，绝不落到某个目标的注入文本上。
+            _ => throw new ArgumentOutOfRangeException(nameof(id), id, "未知目标 id：没有对应的注入文本定义。"),
         };
         var policy = new PolicyStore(dataDir);
         policy.Materialize(defs);
@@ -127,10 +119,6 @@ public sealed class MultiTargetEngine : IAgentEngine
         "dsh" => "DeepSeek Harness",
         "zcode" => "ZCode",
         "opencode" => "opencode-cli",
-        "antigravity" => "Antigravity",
-        "cursor" => "Cursor",
-        // Codex 的客户端是 ChatGPT 桌面应用，进程名是 ChatGPT（不是 codex）。
-        "codex" => "ChatGPT",
         _ => null,
     };
 

@@ -163,7 +163,7 @@ DSH 适配器的自检里有一条可选用例：同一份出厂补丁层 + 同�
 
 反直觉的实测细节：`FirstParty` 标记（`You are opencode, an interactive CLI tool`）在 blob 里命中 **0** —— opencode 的基础 system prompt **不走 blob 通道**，blob 只记常驻指令。所以"我们注入的文本进没进上下文"看 blob 是权威视图，但"客户端自己的基础提示词是什么"得去 203.8 MB 的二进制里读。
 
-## 八、界面交互回归（UIA 驱动，54 项断言全过）
+## 八、界面交互回归（UIA 驱动，60 项断言全过）
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File toolkit\tools\ui-regression.ps1
@@ -186,7 +186,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File toolkit\tools\ui-regression.
 
 **脚本本身的三个坑（都已修，留在代码注释里）**：① 按钮断言必须跑在 DSH 目标下——ZCode 的差异要算 14.8 MB bundle，慢得多；② `已导出文件` 是默认折叠的 Expander，里面的按钮在展开前不在 UIA 树里，且 Expander 头暴露的是 ExpandCollapse 而不是 Invoke；③ 台账页在 ZCode 目标下本来就是空的，断言写"必须有历史判定"会误报。
 
-## 十、安装包（单文件 setup.exe + MSI）
+## 九、安装包（单文件 setup.exe + MSI）
 
 **产品名：`Jailbreak Tool`**（发布者 `Jailbreak`）。图标由 `Downloads\盾牌关闭.png` 转成多尺寸 `.ico`（16/32/48/64/128），同一份用在 exe 内嵌图标、快捷方式、「添加/删除程序」与引导程序 logo。
 
@@ -275,7 +275,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File toolkit\installer\build-inst
 
 WiX **v6/v7 要接受 OSMF 收费 EULA**（`error WIX7015`），v5 是免费版（本项目用 5.0.2）。构建脚本按 v5 写，别升。
 
-## 十一、双注入方案（三个目标）
+## 十、双注入方案（三个目标）
 
 | 方案 | 内容 | 性质 |
 |---|---|---|
@@ -288,7 +288,7 @@ B 套载体槽：DSH→`prefix`、ZCode→`payload`、opencode→`system`；该�
 
 **B 套原文的 sha256：`37382fb7082652e5b18c99fa5086fbc6d414993eaeae2ec7852ba372b031acac`（7,575 字节）**，自检里断言"内嵌资源 == 落盘资产 == 部署副本"三处一致——这是原文没被动过的证明。
 
-## 十二、未验证（如实标注）
+## 十一、未验证（如实标注）
 
 - **没有对真实客户端执行 apply / revert**。两个目标当前都是注入态，重写没有意义；写路径的证据来自沙箱自检（幂等、逐字节还原、污染拒绝、fail-closed）。
 - **探针的"半破/没破"区间没有样本**：六条全落在"破了"，说明当前配置在这六个维度上没留下可观察的犹豫。要标定判据下界，得拿一个未注入的客户端或未注入的模型做对照。

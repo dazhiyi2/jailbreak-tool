@@ -238,7 +238,7 @@ public sealed class SchemeStore
 }
 
 /// <summary>
-/// 按当前方案解析定义。五个目标都必须走这里，不要在适配器里散落 FirstOrDefault 查询：
+/// 按当前方案解析定义。三个目标都必须走这里，不要在适配器里散落 FirstOrDefault 查询：
 /// 同一名字在两套方案里各有一条定义（FileName 不同，互不覆盖）。
 /// </summary>
 public static class SchemeResolve

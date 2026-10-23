@@ -6,7 +6,7 @@ namespace AgentToolkit.SelfTest;
 
 /// <summary>
 /// 双注入方案（own / protocol）的共享断言。
-/// 五个目标的自检都走这里，保证判据一致：原文 verbatim、方案选择器、空槽、遗留清理、标记集、真实客户端只读。
+/// 三个目标的自检都走这里，保证判据一致：原文 verbatim、方案选择器、空槽、遗留清理、标记集、真实客户端只读。
 /// </summary>
 public static class DualScheme
 {
